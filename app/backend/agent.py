@@ -7,6 +7,9 @@ Pipeline: Deepgram STT → Qwen2.5-0.5B (Intent) → State Machine → gpt-5.4-n
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import sys
 import json
 import asyncio
@@ -15,7 +18,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterable
 
 import livekit.rtc as rtc
-from livekit.agents import Agent, AgentSession, AgentServer, TurnHandlingOptions
+from livekit.agents import Agent, AgentSession, AgentServer, TurnHandlingOptions, ModelSettings
 from livekit.agents import llm as lk_llm
 from livekit.plugins import deepgram, openai, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -82,7 +85,7 @@ class AkashAgent(Agent):
         self,
         chat_ctx: lk_llm.ChatContext,
         tools: list[lk_llm.FunctionTool],
-        model_settings: lk_llm.ModelSettings,
+        model_settings: ModelSettings,
     ) -> AsyncIterable[lk_llm.ChatChunk]:
         """
         Intercepts LiveKit's STT→LLM pipeline.
@@ -90,15 +93,15 @@ class AkashAgent(Agent):
         """
 
         # Extract user messages
-        user_messages = [m for m in chat_ctx.messages if m.role == "user"]
+        user_messages = [m for m in chat_ctx.messages() if m.role == "user"]
 
         if not user_messages:
             # First turn (greeting) or programmatic generation
             # Delegate to default — the instructions from generate_reply carry the persona
             response_buffer = []
             async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
-                if hasattr(chunk, "text") and chunk.text:
-                    response_buffer.append(chunk.text)
+                if chunk.delta and chunk.delta.content:
+                    response_buffer.append(chunk.delta.content)
                 yield chunk
 
             # Capture agent response in transcript
@@ -112,7 +115,7 @@ class AkashAgent(Agent):
                 })
             return
 
-        latest_transcript = user_messages[-1].text
+        latest_transcript = user_messages[-1].text_content
         logger.info(f"[STT] {latest_transcript}")
 
         # ── STAGE 2: CLASSIFY INTENT ──
@@ -156,13 +159,13 @@ class AkashAgent(Agent):
 
             controlled_ctx = lk_llm.ChatContext()
             for msg in payload:
-                controlled_ctx.append(role=msg["role"], text=msg["content"])
+                controlled_ctx.add_message(role=msg["role"], content=msg["content"])
 
             pipeline_logger.start("LLM")
             response_buffer = []
             async for chunk in Agent.default.llm_node(self, controlled_ctx, [], model_settings):
-                if hasattr(chunk, "text") and chunk.text:
-                    response_buffer.append(chunk.text)
+                if chunk.delta and chunk.delta.content:
+                    response_buffer.append(chunk.delta.content)
                 yield chunk
 
             pipeline_logger.end("LLM", tokens=len(response_buffer))
@@ -202,7 +205,7 @@ class AkashAgent(Agent):
     async def tts_node(
         self,
         text: AsyncIterable[str],
-        model_settings: lk_llm.ModelSettings,
+        model_settings: ModelSettings,
     ) -> AsyncIterable[rtc.AudioFrame]:
         """Split LLM output at danda (।) boundaries before sending to Sarvam TTS."""
         buffer = ""
@@ -239,6 +242,16 @@ async def entrypoint(ctx):
     """LiveKit room session entrypoint."""
     # Pull CRM data from room metadata
     crm_data = json.loads(ctx.room.metadata or "{}")
+    if not crm_data:
+        # Fallback: check first participant's metadata
+        for p in ctx.room.remote_participants.values():
+            if p.metadata:
+                try:
+                    crm_data = json.loads(p.metadata)
+                    break
+                except json.JSONDecodeError:
+                    continue
+
     logger.info(f"[SESSION] New call. CRM: {crm_data.get('customer_name', 'Unknown')}")
 
     session = AgentSession(
@@ -247,7 +260,7 @@ async def entrypoint(ctx):
             model="nova-3",
             language="multi",
             interim_results=True,
-            endpointing=300,
+            endpointing_ms=300,
             smart_format=True,
             punctuate=True,
         ),
