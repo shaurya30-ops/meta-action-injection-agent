@@ -1,0 +1,9 @@
+"# Placeholder for LoRA adapter files after training.
+# After training, copy these files here:
+#   adapter_config.json
+#   adapter_model.safetensors
+#   tokenizer.json
+#   tokenizer_config.json
+#   special_tokens_map.json
+#   training_metadata.json
+"
