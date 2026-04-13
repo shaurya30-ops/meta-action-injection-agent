@@ -37,7 +37,6 @@ from intent_classifier.classifier import IntentClassifier
 from prompts.persona import AKASH_SYSTEM_PROMPT
 from prompts.payload_builder import build_llm_payload
 from prompts.template_renderer import render_template
-from tts.danda_splitter import split_at_danda, async_iter
 from dispositions.resolver import compute_disposition
 from dispositions.logger import log_call
 from utils.logger import pipeline_logger
@@ -201,33 +200,6 @@ class AkashAgent(Agent):
         except Exception as e:
             logger.error(f"Disconnect error: {e}")
 
-    # ── Custom TTS: Devanagari Danda-Aware Chunking ──
-    async def tts_node(
-        self,
-        text: AsyncIterable[str],
-        model_settings: ModelSettings,
-    ) -> AsyncIterable[rtc.AudioFrame]:
-        """Split LLM output at danda (।) boundaries before sending to Sarvam TTS."""
-        buffer = ""
-        async for chunk in text:
-            buffer += chunk
-
-            segments = split_at_danda(buffer)
-            if len(segments) > 1:
-                for segment in segments[:-1]:
-                    if segment.strip():
-                        async for frame in Agent.default.tts_node(
-                            self, async_iter(segment), model_settings
-                        ):
-                            yield frame
-                buffer = segments[-1]
-
-        # Flush remaining
-        if buffer.strip():
-            async for frame in Agent.default.tts_node(
-                self, async_iter(buffer), model_settings
-            ):
-                yield frame
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -240,17 +212,19 @@ server = AgentServer()
 @server.rtc_session(agent_name="akash-welcome-call")
 async def entrypoint(ctx):
     """LiveKit room session entrypoint."""
-    # Pull CRM data from room metadata
-    crm_data = json.loads(ctx.room.metadata or "{}")
+    crm_data = None
+    # Pull CRM data from participant metadata
+    for p in ctx.room.remote_participants.values():
+        if p.metadata:
+            try:
+                crm_data = json.loads(p.metadata)
+                break
+            except json.JSONDecodeError:
+                continue
+    
     if not crm_data:
-        # Fallback: check first participant's metadata
-        for p in ctx.room.remote_participants.values():
-            if p.metadata:
-                try:
-                    crm_data = json.loads(p.metadata)
-                    break
-                except json.JSONDecodeError:
-                    continue
+        # Fallback to room metadata
+        crm_data = json.loads(ctx.room.metadata or "{}")
 
     logger.info(f"[SESSION] New call. CRM: {crm_data.get('customer_name', 'Unknown')}")
 
