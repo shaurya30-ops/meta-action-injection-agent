@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterable
 
 import livekit.rtc as rtc
-from livekit.agents import Agent, AgentSession, AgentServer, TurnHandlingOptions, ModelSettings
+from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, TurnHandlingOptions, ModelSettings
 from livekit.agents import llm as lk_llm
 from livekit.plugins import deepgram, openai, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -66,18 +66,7 @@ class AkashAgent(Agent):
         self.classifier = IntentClassifier()
         self._init_greeting_done = False
 
-    # ── Agent joins room — speak first ──
-    async def on_enter(self) -> None:
-        """Akash initiates the call. Customer doesn't speak first."""
-        # Execute auto-chain: OPENING_GREETING (AUTO) → CONFIRM_IDENTITY (WAIT)
-        auto_chain = execute_auto_chain(self.session_data, State.OPENING_GREETING)
-        combined_action = combine_chain_actions(auto_chain, self.session_data)
-        pipeline_logger.log_auto_chain(auto_chain)
-
-        # Build full greeting instruction with persona
-        greeting_instruction = f"{AKASH_SYSTEM_PROMPT}\n\nतत्काल निर्देश: {combined_action}"
-        await self.session.generate_reply(instructions=greeting_instruction)
-        self._init_greeting_done = True
+    # ── Agent is initialized (greeting moved to entrypoint) ──
 
     # ── Core Pipeline: STT → Intent → State Machine → LLM Render ──
     async def llm_node(
@@ -203,28 +192,35 @@ class AkashAgent(Agent):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# LIVEKIT SERVER SETUP
+# LIVEKIT WORKER SETUP
 # ══════════════════════════════════════════════════════════════════════
 
-server = AgentServer()
-
-
-@server.rtc_session(agent_name="akash-welcome-call")
-async def entrypoint(ctx):
+async def entrypoint(ctx: JobContext):
     """LiveKit room session entrypoint."""
-    crm_data = None
-    # Pull CRM data from participant metadata
-    for p in ctx.room.remote_participants.values():
-        if p.metadata:
-            try:
-                crm_data = json.loads(p.metadata)
-                break
-            except json.JSONDecodeError:
-                continue
+    await ctx.connect()
     
+    try:
+        participant = await asyncio.wait_for(
+            ctx.wait_for_participant(), timeout=30
+        )
+    except asyncio.TimeoutError:
+        logger.error("[SESSION] Timeout waiting for participant")
+        return
+
+    # Safe metadata read AFTER participant is confirmed
+    crm_data = {}
+    if participant.metadata:
+        try:
+            crm_data = json.loads(participant.metadata)
+        except json.JSONDecodeError:
+            pass
+            
     if not crm_data:
         # Fallback to room metadata
-        crm_data = json.loads(ctx.room.metadata or "{}")
+        try:
+            crm_data = json.loads(ctx.room.metadata or "{}")
+        except json.JSONDecodeError:
+            pass
 
     logger.info(f"[SESSION] New call. CRM: {crm_data.get('customer_name', 'Unknown')}")
 
@@ -254,12 +250,31 @@ async def entrypoint(ctx):
         ),
     )
 
+    agent = AkashAgent(crm_data=crm_data)
     await session.start(
-        agent=AkashAgent(crm_data=crm_data),
+        agent=agent,
         room=ctx.room,
     )
+    
+    # ── Greeting AFTER session.start ──
+    await asyncio.sleep(1.0)
+    
+    # Execute auto-chain: OPENING_GREETING (AUTO) → CONFIRM_IDENTITY (WAIT)
+    auto_chain = execute_auto_chain(agent.session_data, State.OPENING_GREETING)
+    combined_action = combine_chain_actions(auto_chain, agent.session_data)
+    pipeline_logger.log_auto_chain(auto_chain)
+
+    # Build full greeting instruction with persona
+    greeting_instruction = f"{AKASH_SYSTEM_PROMPT}\n\nतत्काल निर्देश: {combined_action}"
+    await session.generate_reply(instructions=greeting_instruction)
+    agent._init_greeting_done = True
 
 
 if __name__ == "__main__":
     from livekit.agents import cli
-    cli.run_app(server)
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name="akash-welcome-call"
+        )
+    )
