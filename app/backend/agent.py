@@ -131,12 +131,11 @@ def _parse_metadata_object(raw_metadata: Any, source: str) -> dict[str, Any]:
     parsed: dict[str, Any] = {}
     for line_no, raw_line in enumerate(stripped.splitlines(), start=1):
         line = raw_line.strip().rstrip(",")
-        if not line:
+        if not line or line == "{" or line == "}":
             continue
         if ":" not in line:
-            raise ValueError(
-                f"Metadata line {line_no} from {source!r} is missing ':' -> {raw_line!r}"
-            )
+            logger.warning(f"[SESSION] Skipping malformed metadata line: {raw_line!r}")
+            continue
 
         raw_key, raw_value = line.split(":", 1)
         key = raw_key.strip().strip('"').strip("'")
@@ -245,11 +244,12 @@ def combine_chain_actions(chain: list[State], session_data: CallSession) -> str:
 
 
 class AkashAgent(Agent):
-    def __init__(self, crm_data: dict):
+    def __init__(self, crm_data: dict, ctx: JobContext):
         super().__init__(instructions="")
         self.session_data = CallSession(**crm_data)
         self.classifier = IntentClassifier()
         self._init_greeting_done = False
+        self.ctx = ctx
 
     async def _stream_default_llm_with_retries(
         self,
@@ -428,7 +428,7 @@ class AkashAgent(Agent):
         """Wait for TTS to finish playing, then disconnect."""
         await asyncio.sleep(4)
         try:
-            await self.session.room.disconnect()
+            await self.ctx.room.disconnect()
         except Exception as e:
             logger.error(f"Disconnect error: {e}")
 
@@ -480,7 +480,7 @@ async def entrypoint(ctx: JobContext):
         ),
     )
 
-    agent = AkashAgent(crm_data=crm_data)
+    agent = AkashAgent(crm_data=crm_data, ctx=ctx)
     await session.start(
         agent=agent,
         room=ctx.room,
