@@ -1,5 +1,5 @@
 """
-Akash Voice Agent — LiveKit Entrypoint
+आकृति Voice Agent — LiveKit Entrypoint
 Marg ई आर पी Solutions Welcome Call
 
 Architecture: Deterministic State Machine + LLM as Rendering Engine
@@ -37,20 +37,40 @@ from state_machine.transitions import AUTO_TRANSITIONS
 from state_machine.resolver import resolve_next_state, post_transition, execute_auto_chain
 from state_machine.programmatic import resolve_programmatic
 from intent_classifier.classifier import IntentClassifier
-from prompts.persona import AKASH_SYSTEM_PROMPT
+from prompts.persona import आकृति_SYSTEM_PROMPT
 from prompts.payload_builder import build_llm_payload
 from prompts.template_renderer import render_template
+from content_extraction.extractor_logic import build_render_context
 from dispositions.resolver import compute_disposition
 from dispositions.logger import log_call
-from utils.logger import pipeline_logger
+from utils.logger import pipeline_logger, log_metric
 import config
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("akash.agent")
+logger = logging.getLogger("आकृति.agent")
 CALL_SESSION_FIELDS = {field.name for field in fields(CallSession)}
+CRM_FIELD_ALIASES = {
+    "name": "customer_name",
+    "customer name": "customer_name",
+    "company name": "company_name",
+    "firm name": "firm_name",
+    "phone number": "primary_phone",
+    "mobile number": "primary_phone",
+    "primary phone": "primary_phone",
+    "email id": "crm_email",
+    "email": "crm_email",
+    "pin code": "crm_pincode",
+    "pincode": "crm_pincode",
+    "business type": "crm_business_type",
+    "business trade": "crm_business_trade",
+}
+
+
+def _normalize_metadata_key(key: str) -> str:
+    return " ".join(str(key).replace("_", " ").replace("-", " ").split()).strip().lower()
 
 
 def _metadata_excerpt(raw: Any, limit: int = 200) -> str:
@@ -155,8 +175,15 @@ def _parse_metadata_object(raw_metadata: Any, source: str) -> dict[str, Any]:
 
 
 def _sanitize_crm_data(crm_data: dict[str, Any], source: str) -> dict[str, Any]:
-    sanitized = {key: value for key, value in crm_data.items() if key in CALL_SESSION_FIELDS}
-    ignored = sorted(set(crm_data) - CALL_SESSION_FIELDS)
+    sanitized: dict[str, Any] = {}
+    ignored: list[str] = []
+
+    for key, value in crm_data.items():
+        target_key = key if key in CALL_SESSION_FIELDS else CRM_FIELD_ALIASES.get(_normalize_metadata_key(key))
+        if target_key is None:
+            ignored.append(key)
+            continue
+        sanitized[target_key] = value
 
     if ignored:
         logger.warning("[SESSION] Ignoring unknown CRM metadata keys from %s: %s", source, ignored)
@@ -238,12 +265,12 @@ def combine_chain_actions(chain: list[State], session_data: CallSession) -> str:
     for state in chain:
         action = ACTION_MAP.get(state)
         if action:
-            rendered = render_template(action, session_data.__dict__)
+            rendered = render_template(action, build_render_context(session_data))
             combined.append(rendered)
     return "\n".join(combined)
 
 
-class AkashAgent(Agent):
+class आकृतिAgent(Agent):
     def __init__(self, crm_data: dict, ctx: JobContext):
         super().__init__(instructions="")
         self.session_data = CallSession(**crm_data)
@@ -376,13 +403,14 @@ class AkashAgent(Agent):
         else:
             action = ACTION_MAP.get(self.session_data.current_state)
             if action:
-                combined_action = render_template(action, self.session_data.__dict__)
+                combined_action = render_template(action, build_render_context(self.session_data))
             else:
                 combined_action = None
 
         # ── STAGE 5: BUILD 3-PART PAYLOAD & GENERATE ──
         if combined_action and self.session_data.current_state != State.END:
             payload = build_llm_payload(self.session_data, action_override=combined_action)
+            logger.info(f"[LLM_PROMPT] Full payload being sent to LLM:\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
 
             controlled_ctx = lk_llm.ChatContext()
             for msg in payload:
@@ -390,6 +418,8 @@ class AkashAgent(Agent):
 
             pipeline_logger.start("LLM")
             response_buffer = []
+            prompt_tokens = 0
+            
             async for chunk in self._stream_default_llm_with_retries(
                 controlled_ctx,
                 [],
@@ -397,9 +427,15 @@ class AkashAgent(Agent):
                 response_buffer,
                 "LLM",
             ):
+                if getattr(chunk, "usage", None):
+                    prompt_tokens = getattr(chunk.usage, "prompt_tokens", prompt_tokens)
                 yield chunk
 
-            pipeline_logger.end("LLM", tokens=len(response_buffer))
+            if prompt_tokens == 0:
+                # Fallback approximation if no usage stats returned
+                prompt_tokens = sum(len(m.get("content", "")) // 4 for m in payload)
+                
+            pipeline_logger.end("LLM", tokens=prompt_tokens)
 
             # Capture agent response
             full_response = "".join(response_buffer)
@@ -452,7 +488,7 @@ async def entrypoint(ctx: JobContext):
 
     crm_data = await _resolve_crm_data(ctx, participant)
 
-    logger.info(f"[SESSION] New call. CRM: {crm_data.get('customer_name', 'Unknown')}")
+    logger.info(f"[SESSION] New call. CRM: {crm_data.get('customer_name') or crm_data.get('company_name') or 'Unknown'}")
 
     session = AgentSession(
         vad=silero.VAD.load(),
@@ -468,7 +504,7 @@ async def entrypoint(ctx: JobContext):
         tts=sarvam.TTS(
             model="bulbul:v3",
             target_language_code="hi-IN",
-            speaker="aditya",
+            speaker="ritu",
             pace=1.0,
             temperature=0.6,
             min_buffer_size=50,
@@ -480,7 +516,11 @@ async def entrypoint(ctx: JobContext):
         ),
     )
 
-    agent = AkashAgent(crm_data=crm_data, ctx=ctx)
+    @session.on("metrics_collected")
+    def _on_metrics_collected(metrics):
+        log_metric(metrics)
+
+    agent = आकृतिAgent(crm_data=crm_data, ctx=ctx)
     await session.start(
         agent=agent,
         room=ctx.room,
@@ -517,7 +557,7 @@ async def entrypoint(ctx: JobContext):
     pipeline_logger.log_auto_chain(auto_chain)
 
     # Build full greeting instruction with persona
-    greeting_instruction = f"{AKASH_SYSTEM_PROMPT}\n\nतत्काल निर्देश: {combined_action}"
+    greeting_instruction = f"{आकृति_SYSTEM_PROMPT}\n\nतत्काल निर्देश: {combined_action}"
     await session.generate_reply(instructions=greeting_instruction)
     agent._init_greeting_done = True
 
@@ -527,6 +567,7 @@ if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            agent_name="akash-welcome-call"
+            agent_name="आकृति-welcome-call"
         )
     )
+

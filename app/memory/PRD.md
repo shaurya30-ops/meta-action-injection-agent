@@ -1,7 +1,7 @@
-# Akash Voice Agent — PRD
+# आकृति Voice Agent — PRD
 
 ## Problem Statement
-Build a high-performance, real-time voice agent (Akash) for Marg ERP Solutions. Deterministic state machine architecture where LLM acts as a linguistic rendering engine.
+Build a high-performance, real-time voice agent (आकृति) for Marg ERP Solutions. Deterministic state machine architecture where LLM acts as a linguistic rendering engine.
 
 ## Architecture
 - STT: Deepgram Nova-3 (Hinglish)
@@ -19,7 +19,7 @@ Build a high-performance, real-time voice agent (Akash) for Marg ERP Solutions. 
 - 3 programmatic decision nodes (sentiment eligibility, price retry, callback routing)
 - Intent classifier with LoRA adapter loading + regex fallback
 - Content extraction layer (phone, email, pincode, business, datetime, free text)
-- Akash persona prompt (male, Devanagari Hindi + Latin English, brand-compliant)
+- आकृति persona prompt (male, Devanagari Hindi + Latin English, brand-compliant)
 - 3-part sandwich payload builder with action_override for auto-chains
 - Devanagari danda-aware TTS chunking
 - Sentiment tracker (sticky negative, D-SAT flag)
@@ -37,7 +37,7 @@ Build a high-performance, real-time voice agent (Akash) for Marg ERP Solutions. 
 3. D-SAT: Escalation -> Urgent flag -> Close without reference pitch
 
 ## Backlog (P0)
-- Upload trained LoRA adapter to models/akash-intent-classifier/
+- Upload trained LoRA adapter to models/आकृति-intent-classifier/
 - Test on LiveKit Playground with real API keys
 - Add Hinglish datetime parser (currently stores raw text)
 - Add spoken email normalizer improvements
