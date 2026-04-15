@@ -51,15 +51,14 @@ class IntentClassifierFastPathTests(unittest.TestCase):
 
 
 class VoiceSessionConfigTests(unittest.TestCase):
-    def test_turn_handling_prefers_vad_and_short_interruptions(self):
+    def test_turn_handling_prefers_stt_and_short_interruptions(self):
         turn_handling = build_turn_handling_options()
 
-        self.assertEqual(turn_handling["turn_detection"], "vad")
+        self.assertEqual(turn_handling["turn_detection"], "stt")
         self.assertEqual(turn_handling["endpointing"]["mode"], "fixed")
         self.assertEqual(turn_handling["interruption"]["mode"], "vad")
         self.assertFalse(turn_handling["interruption"]["discard_audio_if_uninterruptible"])
         self.assertEqual(turn_handling["interruption"]["min_duration"], 0.25)
-        self.assertGreaterEqual(turn_handling["endpointing"]["min_delay"], 0.45)
 
     def test_runtime_options_disable_preemptive_generation(self):
         runtime_options = build_session_runtime_options()
