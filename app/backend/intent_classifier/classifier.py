@@ -2,6 +2,7 @@ import asyncio
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 import logging
+import re
 import threading
 from pathlib import Path
 from state_machine.intents import Intent
@@ -182,6 +183,27 @@ class IntentClassifier:
         except Exception as e:
             logger.error(f"Failed to load background classifier model (will use API fallback): {e}")
 
+    def _classify_fast_path(self, transcript: str) -> Intent | None:
+        normalized = " ".join(transcript.strip().split())
+        if not normalized:
+            return Intent.UNCLEAR
+
+        fallback_intent = self._fallback.classify(normalized)
+        if fallback_intent == Intent.UNCLEAR:
+            return None
+
+        if fallback_intent == Intent.INFORM:
+            if re.search(r"\d{6,}", normalized):
+                return fallback_intent
+            if re.search(r"@|at the rate", normalized, re.IGNORECASE):
+                return fallback_intent
+            return None
+
+        if len(normalized) <= config.CLASSIFIER_FASTPATH_MAX_CHARS:
+            return fallback_intent
+
+        return None
+
     async def classify(self, transcript: str) -> Intent:
         """
         Classify a transcript into an Intent enum.
@@ -189,6 +211,10 @@ class IntentClassifier:
         """
         if not transcript or not transcript.strip():
             return Intent.UNCLEAR
+
+        if fast_path_intent := self._classify_fast_path(transcript):
+            logger.info("Classifier fast-pathed transcript to %s", fast_path_intent.value)
+            return fast_path_intent
 
         loop = asyncio.get_running_loop()
         pool = _get_global_pool(self.adapter_path)

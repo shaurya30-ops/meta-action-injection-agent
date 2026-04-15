@@ -23,8 +23,7 @@ from typing import Any, AsyncIterable
 import livekit.rtc as rtc
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, TurnHandlingOptions, ModelSettings
 from livekit.agents import llm as lk_llm
-from livekit.plugins import deepgram, openai, sarvam, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.plugins import deepgram, openai, silero
 
 # Ensure backend root is in path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -37,14 +36,19 @@ from state_machine.transitions import AUTO_TRANSITIONS
 from state_machine.resolver import resolve_next_state, post_transition, execute_auto_chain
 from state_machine.programmatic import resolve_programmatic
 from intent_classifier.classifier import IntentClassifier
-from prompts.persona import आकृति_SYSTEM_PROMPT
-from prompts.payload_builder import build_llm_payload
+from prompts.payload_builder import build_action_text
 from prompts.template_renderer import render_template
 from content_extraction.extractor_logic import build_render_context
 from dispositions.resolver import compute_disposition
 from dispositions.logger import log_call
 from utils.logger import pipeline_logger, log_metric
+from utils.stable_sarvam import StableSarvamTTS
 from utils.transcript import sanitize_user_transcript
+from utils.voice_session import (
+    build_session_connect_options,
+    build_session_runtime_options,
+    build_turn_handling_options,
+)
 import config
 
 logging.basicConfig(
@@ -411,42 +415,24 @@ class आकृतिAgent(Agent):
             else:
                 combined_action = None
 
-        # ── STAGE 5: BUILD 3-PART PAYLOAD & GENERATE ──
+        # ── STAGE 5: DIRECT RENDER ──
         if combined_action and self.session_data.current_state != State.END:
-            payload = build_llm_payload(self.session_data, action_override=combined_action)
-            logger.info(f"[LLM_PROMPT] Full payload being sent to LLM:\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
-
-            controlled_ctx = lk_llm.ChatContext()
-            for msg in payload:
-                controlled_ctx.add_message(role=msg["role"], content=msg["content"])
-
-            pipeline_logger.start("LLM")
-            response_buffer = []
-            prompt_tokens = 0
-            
-            async for chunk in self._stream_default_llm_with_retries(
-                controlled_ctx,
-                [],
-                model_settings,
-                response_buffer,
-                "LLM",
-            ):
-                if getattr(chunk, "usage", None):
-                    prompt_tokens = getattr(chunk.usage, "prompt_tokens", prompt_tokens)
-                yield chunk
-
-            if prompt_tokens == 0:
-                # Fallback approximation if no usage stats returned
-                prompt_tokens = sum(len(m.get("content", "")) // 4 for m in payload)
-                
-            pipeline_logger.end("LLM", tokens=prompt_tokens)
-
-            # Capture agent response
-            full_response = "".join(response_buffer)
-            if full_response:
+            direct_response = build_action_text(
+                self.session_data,
+                action_override=combined_action,
+            )
+            if direct_response:
+                pipeline_logger.start("RENDER")
+                logger.info(
+                    "[DIRECT_RENDER] state=%s text=%s",
+                    self.session_data.current_state.value,
+                    direct_response,
+                )
+                yield direct_response
+                pipeline_logger.end("RENDER", mode="direct")
                 self.session_data.transcript.append({
                     "role": "agent",
-                    "text": full_response,
+                    "text": direct_response,
                     "state": self.session_data.current_state.value,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 })
@@ -493,6 +479,19 @@ async def entrypoint(ctx: JobContext):
     crm_data = await _resolve_crm_data(ctx, participant)
 
     logger.info(f"[SESSION] New call. CRM: {crm_data.get('customer_name') or crm_data.get('company_name') or 'Unknown'}")
+    turn_handling = build_turn_handling_options()
+    runtime_options = build_session_runtime_options()
+    conn_options = build_session_connect_options()
+    logger.info(
+        "[VOICE_RUNTIME] turn_detection=%s endpointing=%s interruption=%s preemptive_generation=%s aec_warmup=%s tts_timeout=%s tts_retries=%s",
+        turn_handling["turn_detection"],
+        turn_handling["endpointing"],
+        turn_handling["interruption"],
+        runtime_options["preemptive_generation"],
+        runtime_options["aec_warmup_duration"],
+        conn_options.tts_conn_options.timeout,
+        conn_options.tts_conn_options.max_retry,
+    )
 
     session = AgentSession(
         vad=silero.VAD.load(),
@@ -505,7 +504,7 @@ async def entrypoint(ctx: JobContext):
             punctuate=True,
         ),
         llm=openai.LLM(model="gpt-5.4-nano"),
-        tts=sarvam.TTS(
+        tts=StableSarvamTTS(
             model="bulbul:v3",
             target_language_code="hi-IN",
             speaker="ritu",
@@ -515,14 +514,25 @@ async def entrypoint(ctx: JobContext):
             max_chunk_length=150,
             speech_sample_rate=22050,
         ),
-        turn_handling=TurnHandlingOptions(
-            turn_detection=MultilingualModel(),
-        ),
+        turn_handling=TurnHandlingOptions(**turn_handling),
+        preemptive_generation=runtime_options["preemptive_generation"],
+        min_consecutive_speech_delay=runtime_options["min_consecutive_speech_delay"],
+        aec_warmup_duration=runtime_options["aec_warmup_duration"],
+        conn_options=conn_options,
     )
 
     @session.on("metrics_collected")
     def _on_metrics_collected(metrics):
         log_metric(metrics)
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(ev):
+        if ev.is_final and ev.transcript:
+            logger.info(
+                "[TURN_CAPTURED] final=%r language=%s",
+                ev.transcript,
+                ev.language,
+            )
 
     agent = आकृतिAgent(crm_data=crm_data, ctx=ctx)
     await session.start(
@@ -560,9 +570,14 @@ async def entrypoint(ctx: JobContext):
     combined_action = combine_chain_actions(auto_chain, agent.session_data)
     pipeline_logger.log_auto_chain(auto_chain)
 
-    # Build full greeting instruction with persona
-    greeting_instruction = f"{आकृति_SYSTEM_PROMPT}\n\nतत्काल निर्देश: {combined_action}"
-    await session.generate_reply(instructions=greeting_instruction)
+    logger.info("[DIRECT_RENDER] state=%s text=%s", agent.session_data.current_state.value, combined_action)
+    agent.session_data.transcript.append({
+        "role": "agent",
+        "text": combined_action,
+        "state": agent.session_data.current_state.value,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+    session.say(combined_action)
     agent._init_greeting_done = True
 
 

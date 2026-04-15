@@ -331,6 +331,12 @@ def resolve_next_state(session: CallSession, intent: Intent, transcript: str) ->
             session.billing_started = "NOT_STARTED"
             return State.ASK_BILLING_STATUS
 
+    if session.current_state == State.VERIFY_PINCODE and extract_digits(transcript):
+        session.pincode = ""
+        session.pincode_digit_buffer = ""
+        session.awaiting_pincode_confirmation = False
+        return _resolve_pincode_collection(session, intent, transcript)
+
     if session.current_state in PRE_COLLECTION_PHONE_STATES and extract_digits(transcript):
         (
             buffer_attr,

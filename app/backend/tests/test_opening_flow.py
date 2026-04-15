@@ -11,6 +11,7 @@ from dispositions.resolver import compute_disposition
 from content_extraction.extractor_logic import build_render_context
 from intent_classifier.classifier import _load_worker_tokenizer
 from intent_classifier.fallback import RegexFallbackClassifier
+from prompts.payload_builder import build_action_text
 from state_machine.intents import Intent
 from state_machine.resolver import post_transition, resolve_next_state
 from state_machine.session import CallSession
@@ -204,6 +205,35 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(session.current_state, State.COLLECT_ALTERNATE_NUMBER)
         self.assertEqual(session.alternate_digit_buffer, "9876543210")
         self.assertTrue(session.awaiting_alternate_confirmation)
+
+    def test_verify_pincode_inline_digits_preload_confirmation(self):
+        session = CallSession(current_state=State.VERIFY_PINCODE)
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "नहीं दूसरा pin code है one one zero zero one two.",
+        )
+
+        self.assertEqual(next_state, State.COLLECT_PINCODE)
+        self.assertEqual(session.current_state, State.COLLECT_PINCODE)
+        self.assertEqual(session.pincode_digit_buffer, "110012")
+        self.assertTrue(session.awaiting_pincode_confirmation)
+
+
+class PromptRenderingTests(unittest.TestCase):
+    def test_build_action_text_preserves_exact_rendered_dialogue(self):
+        session = CallSession(
+            current_state=State.VERIFY_PINCODE,
+            crm_pincode="110011",
+        )
+
+        rendered = build_action_text(session)
+
+        self.assertEqual(
+            rendered,
+            "आपका area pin code — one one zero zero one one — यही है?",
+        )
 
 
 class DispositionTests(unittest.TestCase):
