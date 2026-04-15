@@ -118,6 +118,11 @@ class IntentClassifier:
         # Ensure pool spawns on initialization
         _get_global_pool(self.adapter_path)
 
+    def warmup(self):
+        """Blocks until the process pool is fully initialized and warmed up."""
+        pool = _get_global_pool(self.adapter_path)
+        pool.submit(_run_qwen_inference, "warmup_sync").result()
+
     async def classify(self, transcript: str) -> Intent:
         """
         Classify a transcript into an Intent enum.

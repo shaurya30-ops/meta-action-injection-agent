@@ -562,11 +562,20 @@ async def entrypoint(ctx: JobContext):
     agent._init_greeting_done = True
 
 
+def prewarm_process(proc):
+    logger.info("Initializing and pre-warming Intent Classifier...")
+    classifier = IntentClassifier()
+    classifier.warmup()
+    logger.info("Intent Classifier fully warmed up and ready.")
+    proc.userdata["intent_classifier"] = classifier
+
 if __name__ == "__main__":
     from livekit.agents import cli
+    
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm_process,
             agent_name="आकृति-welcome-call"
         )
     )
