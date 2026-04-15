@@ -259,29 +259,38 @@ def build_render_context(session: CallSession) -> dict:
     alternate_digits = session.alternate_number or session.alternate_digit_buffer
     pincode_digits = session.pincode or session.pincode_digit_buffer
     referral_digits = session.referral_number or session.referral_digit_buffer
+    followup_prompt = session.collection_followup_prompt
 
-    if session.awaiting_whatsapp_confirmation and whatsapp_digits:
+    if followup_prompt and session.current_state.name == "COLLECT_WHATSAPP_NUMBER":
+        whatsapp_prompt = followup_prompt
+    elif session.awaiting_whatsapp_confirmation and whatsapp_digits:
         whatsapp_prompt = f"तो आपका WhatsApp number है — {digits_to_tts(whatsapp_digits)} — सही है?"
     elif session.whatsapp_digit_buffer:
         whatsapp_prompt = "जी, आगे बताइए।"
     else:
         whatsapp_prompt = "ठीक है जी — कृपया अपना WhatsApp number बताइए?"
 
-    if session.awaiting_alternate_confirmation and alternate_digits:
+    if followup_prompt and session.current_state.name == "COLLECT_ALTERNATE_NUMBER":
+        alternate_prompt = followup_prompt
+    elif session.awaiting_alternate_confirmation and alternate_digits:
         alternate_prompt = f"तो आपका alternate number है — {digits_to_tts(alternate_digits)} — सही है?"
     elif session.alternate_digit_buffer:
         alternate_prompt = "जी, आगे बताइए।"
     else:
         alternate_prompt = "ठीक है जी — कृपया alternate number बताइए?"
 
-    if session.awaiting_pincode_confirmation and pincode_digits:
+    if followup_prompt and session.current_state.name == "COLLECT_PINCODE":
+        pincode_prompt = followup_prompt
+    elif session.awaiting_pincode_confirmation and pincode_digits:
         pincode_prompt = f"तो आपका pin code है — {digits_to_tts(pincode_digits)} — सही है?"
     elif session.pincode_digit_buffer:
         pincode_prompt = "जी, आगे बताइए।"
     else:
         pincode_prompt = "जी, क्या आप अपना पूरा pin code एक बार में बता सकते हैं?"
 
-    if session.awaiting_referral_confirmation and referral_digits:
+    if followup_prompt and session.current_state.name == "COLLECT_REFERRAL":
+        referral_prompt = followup_prompt
+    elif session.awaiting_referral_confirmation and referral_digits:
         referral_prompt = f"तो referral का number है — {digits_to_tts(referral_digits)} — सही है?"
     elif session.referral_digit_buffer:
         referral_prompt = "जी, आगे बताइए।"

@@ -1,18 +1,22 @@
 ﻿import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from dispositions.resolver import compute_disposition
+from content_extraction.extractor_logic import build_render_context
+from intent_classifier.classifier import _load_worker_tokenizer
 from intent_classifier.fallback import RegexFallbackClassifier
 from state_machine.intents import Intent
 from state_machine.resolver import post_transition, resolve_next_state
 from state_machine.session import CallSession
 from state_machine.states import State
 from state_machine.transitions import TRANSITIONS
+from utils.transcript import sanitize_user_transcript
 
 
 class RegexFallbackClassifierTests(unittest.TestCase):
@@ -30,6 +34,47 @@ class RegexFallbackClassifierTests(unittest.TestCase):
         self.assertEqual(
             self.classifier.classify("जी आप मुझे पांच minute बाद call करो."),
             Intent.DEFER,
+        )
+
+
+class IntentClassifierLoaderTests(unittest.TestCase):
+    @patch("intent_classifier.classifier._is_local_source", return_value=False)
+    @patch("transformers.AutoTokenizer.from_pretrained")
+    def test_broken_adapter_tokenizer_falls_back_to_base_source(
+        self,
+        mocked_from_pretrained,
+        _mocked_is_local_source,
+    ):
+        mocked_from_pretrained.side_effect = [
+            Exception("broken adapter tokenizer"),
+            "base-tokenizer",
+        ]
+
+        tokenizer = _load_worker_tokenizer(
+            "adapter-dir",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+        )
+
+        self.assertEqual(tokenizer, "base-tokenizer")
+        self.assertEqual(mocked_from_pretrained.call_count, 2)
+        self.assertEqual(mocked_from_pretrained.call_args_list[0].args[0], "adapter-dir")
+        self.assertTrue(mocked_from_pretrained.call_args_list[0].kwargs["local_files_only"])
+        self.assertEqual(
+            mocked_from_pretrained.call_args_list[1].args[0],
+            "Qwen/Qwen2.5-0.5B-Instruct",
+        )
+        self.assertFalse(mocked_from_pretrained.call_args_list[1].kwargs["local_files_only"])
+
+
+class TranscriptSanitizerTests(unittest.TestCase):
+    def test_chat_markup_keeps_latest_user_utterance(self):
+        raw = (
+            '<|im_end|>\n<|im_start|>assistant\nजी आगे बताइए<|im_end|>\n'
+            '<|im_start|>user\nnumber कहां तक load हुआ है"}'
+        )
+        self.assertEqual(
+            sanitize_user_transcript(raw),
+            "number कहां तक load हुआ है",
         )
 
 
@@ -116,6 +161,49 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(session.current_state, State.COLLECT_PINCODE)
         self.assertEqual(session.pincode_digit_buffer, "")
         self.assertFalse(session.awaiting_pincode_confirmation)
+
+    def test_alternate_refusal_inform_skips_to_pincode(self):
+        session = CallSession(current_state=State.ASK_ALTERNATE_NUMBER)
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "नई जी कोई alternate number नहीं है.",
+        )
+
+        self.assertEqual(next_state, State.VERIFY_PINCODE)
+        self.assertEqual(session.current_state, State.VERIFY_PINCODE)
+
+    def test_collection_ask_reports_loaded_digits(self):
+        session = CallSession(
+            current_state=State.COLLECT_ALTERNATE_NUMBER,
+            alternate_digit_buffer="9876",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.ASK,
+            "number कहां तक load हुआ है",
+        )
+
+        self.assertEqual(next_state, State.COLLECT_ALTERNATE_NUMBER)
+        context = build_render_context(session)
+        self.assertIn("4 digit load", context["alternate_collection_prompt"])
+        self.assertIn("कुल 10 digit", context["alternate_collection_prompt"])
+
+    def test_direct_alternate_digits_are_captured_on_ask_state(self):
+        session = CallSession(current_state=State.ASK_ALTERNATE_NUMBER)
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "alternate number 9876543210",
+        )
+
+        self.assertEqual(next_state, State.COLLECT_ALTERNATE_NUMBER)
+        self.assertEqual(session.current_state, State.COLLECT_ALTERNATE_NUMBER)
+        self.assertEqual(session.alternate_digit_buffer, "9876543210")
+        self.assertTrue(session.awaiting_alternate_confirmation)
 
 
 class DispositionTests(unittest.TestCase):

@@ -43,6 +43,7 @@ class CallSession:
     callback_time_phrase: str = ""
     callback_closing_text: str = ""
     closing_emitted: bool = False
+    collection_followup_prompt: str = ""
 
     transcript: list = field(default_factory=list)
 

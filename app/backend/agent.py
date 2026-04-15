@@ -44,6 +44,7 @@ from content_extraction.extractor_logic import build_render_context
 from dispositions.resolver import compute_disposition
 from dispositions.logger import log_call
 from utils.logger import pipeline_logger, log_metric
+from utils.transcript import sanitize_user_transcript
 import config
 
 logging.basicConfig(
@@ -369,7 +370,10 @@ class आकृतिAgent(Agent):
                 })
             return
 
-        latest_transcript = user_messages[-1].text_content
+        raw_transcript = user_messages[-1].text_content
+        latest_transcript = sanitize_user_transcript(raw_transcript)
+        if latest_transcript != (raw_transcript or "").strip():
+            logger.info(f"[STT_SANITIZED] raw={raw_transcript!r} cleaned={latest_transcript!r}")
         logger.info(f"[STT] {latest_transcript}")
 
         # ── STAGE 2: CLASSIFY INTENT ──
@@ -576,7 +580,9 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm_process,
-            agent_name="आकृति-welcome-call"
+            agent_name="आकृति-welcome-call",
+            num_idle_processes=1,
+            initialize_process_timeout=120.0
         )
     )
 

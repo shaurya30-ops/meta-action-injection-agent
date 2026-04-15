@@ -6,6 +6,7 @@ from content_extraction.extractor_logic import (
     apply_digit_buffer,
     billing_started,
     build_callback_closing,
+    digits_to_tts,
     extract_and_store,
     extract_callback_phrase,
     extract_digits,
@@ -26,27 +27,51 @@ TERMINAL_OR_AUTO_STATES = {
     State.END,
 }
 
-PHONE_COLLECTION_STATES: dict[State, tuple[str, str, str, State]] = {
+PHONE_COLLECTION_STATES: dict[State, tuple[str, str, str, State, str, int]] = {
     State.COLLECT_WHATSAPP_NUMBER: (
         "whatsapp_digit_buffer",
         "awaiting_whatsapp_confirmation",
         "whatsapp_number",
         State.ASK_ALTERNATE_NUMBER,
+        "WhatsApp number",
+        10,
     ),
     State.COLLECT_ALTERNATE_NUMBER: (
         "alternate_digit_buffer",
         "awaiting_alternate_confirmation",
         "alternate_number",
         State.VERIFY_PINCODE,
+        "alternate number",
+        10,
     ),
     State.COLLECT_REFERRAL: (
         "referral_digit_buffer",
         "awaiting_referral_confirmation",
         "referral_number",
         State.WARM_CLOSING,
+        "referral number",
+        10,
     ),
 }
 
+PRE_COLLECTION_PHONE_STATES: dict[State, tuple[str, str, str, State, str, int]] = {
+    State.VERIFY_WHATSAPP: (
+        "whatsapp_digit_buffer",
+        "awaiting_whatsapp_confirmation",
+        "whatsapp_number",
+        State.COLLECT_WHATSAPP_NUMBER,
+        "WhatsApp number",
+        10,
+    ),
+    State.ASK_ALTERNATE_NUMBER: (
+        "alternate_digit_buffer",
+        "awaiting_alternate_confirmation",
+        "alternate_number",
+        State.COLLECT_ALTERNATE_NUMBER,
+        "alternate number",
+        10,
+    ),
+}
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -82,6 +107,45 @@ def _reset_phone_collection(
     setattr(session, value_attr, "")
 
 
+def _declines_optional_number(transcript: str) -> bool:
+    if extract_digits(transcript):
+        return False
+    normalized = transcript.strip().lower()
+    negative_markers = (
+        "नहीं",
+        "नही",
+        "नई",
+        "जी नहीं",
+        "no",
+        "nahi",
+        "nahin",
+        "nhi",
+    )
+    return any(marker in normalized for marker in negative_markers)
+
+
+def _build_collection_status_prompt(
+    label: str,
+    digits: str,
+    total_digits: int,
+    awaiting_confirmation: bool,
+) -> str:
+    if awaiting_confirmation and digits:
+        return (
+            f"अभी मैंने {label} के लिए — {digits_to_tts(digits)} — load किया है। "
+            "अगर यही सही है तो हाँ कहिए, वरना दोबारा बताइए।"
+        )
+
+    if digits:
+        remaining = max(total_digits - len(digits), 0)
+        return (
+            f"अभी {len(digits)} digit load हुई हैं — {digits_to_tts(digits)}। "
+            f"कुल {total_digits} digit चाहिए, बाकी {remaining} digit बताइए।"
+        )
+
+    return f"अभी कोई digit load नहीं हुई है। कृपया पूरा {label} बताइए।"
+
+
 def _apply_phone_digits(
     session: CallSession,
     transcript: str,
@@ -89,6 +153,7 @@ def _apply_phone_digits(
     buffer_attr: str,
     awaiting_attr: str,
     value_attr: str,
+    total_digits: int,
 ) -> State:
     existing = getattr(session, buffer_attr)
     fresh_digits = extract_digits(transcript)
@@ -96,8 +161,8 @@ def _apply_phone_digits(
     if not fresh_digits:
         return session.current_state
 
-    if len(existing) + len(fresh_digits) > 10:
-        if len(fresh_digits) == 10:
+    if len(existing) + len(fresh_digits) > total_digits:
+        if len(fresh_digits) == total_digits:
             setattr(session, buffer_attr, fresh_digits)
             setattr(session, awaiting_attr, True)
             setattr(session, value_attr, "")
@@ -106,7 +171,7 @@ def _apply_phone_digits(
         _reset_phone_collection(session, buffer_attr, awaiting_attr, value_attr)
         return session.current_state
 
-    combined, status = apply_digit_buffer(existing, transcript, 10)
+    combined, status = apply_digit_buffer(existing, transcript, total_digits)
     setattr(session, buffer_attr, combined)
 
     if status == "complete":
@@ -127,7 +192,18 @@ def _resolve_phone_collection(
     awaiting_attr: str,
     value_attr: str,
     success_state: State,
+    label: str,
+    total_digits: int,
 ) -> State:
+    if intent == Intent.ASK and not extract_digits(transcript):
+        session.collection_followup_prompt = _build_collection_status_prompt(
+            label=label,
+            digits=getattr(session, buffer_attr),
+            total_digits=total_digits,
+            awaiting_confirmation=getattr(session, awaiting_attr),
+        )
+        return session.current_state
+
     if getattr(session, awaiting_attr):
         if intent == Intent.AFFIRM:
             confirmed = getattr(session, buffer_attr)
@@ -152,10 +228,41 @@ def _resolve_phone_collection(
         buffer_attr=buffer_attr,
         awaiting_attr=awaiting_attr,
         value_attr=value_attr,
+        total_digits=total_digits,
     )
 
 
+def _prime_phone_collection(
+    session: CallSession,
+    transcript: str,
+    *,
+    buffer_attr: str,
+    awaiting_attr: str,
+    value_attr: str,
+    target_state: State,
+    total_digits: int,
+) -> State:
+    _apply_phone_digits(
+        session,
+        transcript,
+        buffer_attr=buffer_attr,
+        awaiting_attr=awaiting_attr,
+        value_attr=value_attr,
+        total_digits=total_digits,
+    )
+    return target_state
+
+
 def _resolve_pincode_collection(session: CallSession, intent: Intent, transcript: str) -> State:
+    if intent == Intent.ASK and not extract_digits(transcript):
+        session.collection_followup_prompt = _build_collection_status_prompt(
+            label="pin code",
+            digits=session.pincode_digit_buffer,
+            total_digits=6,
+            awaiting_confirmation=session.awaiting_pincode_confirmation,
+        )
+        return State.COLLECT_PINCODE
+
     if session.awaiting_pincode_confirmation:
         if intent == Intent.AFFIRM:
             session.pincode = session.pincode_digit_buffer
@@ -199,6 +306,8 @@ def _resolve_pincode_collection(session: CallSession, intent: Intent, transcript
 
 
 def resolve_next_state(session: CallSession, intent: Intent, transcript: str) -> State:
+    session.collection_followup_prompt = ""
+
     if session.current_state == State.END:
         return State.END
 
@@ -222,8 +331,37 @@ def resolve_next_state(session: CallSession, intent: Intent, transcript: str) ->
             session.billing_started = "NOT_STARTED"
             return State.ASK_BILLING_STATUS
 
+    if session.current_state in PRE_COLLECTION_PHONE_STATES and extract_digits(transcript):
+        (
+            buffer_attr,
+            awaiting_attr,
+            value_attr,
+            target_state,
+            _label,
+            total_digits,
+        ) = PRE_COLLECTION_PHONE_STATES[session.current_state]
+        return _prime_phone_collection(
+            session,
+            transcript,
+            buffer_attr=buffer_attr,
+            awaiting_attr=awaiting_attr,
+            value_attr=value_attr,
+            target_state=target_state,
+            total_digits=total_digits,
+        )
+
+    if session.current_state == State.ASK_ALTERNATE_NUMBER and _declines_optional_number(transcript):
+        return State.VERIFY_PINCODE
+
     if session.current_state in PHONE_COLLECTION_STATES:
-        buffer_attr, awaiting_attr, value_attr, success_state = PHONE_COLLECTION_STATES[
+        (
+            buffer_attr,
+            awaiting_attr,
+            value_attr,
+            success_state,
+            label,
+            total_digits,
+        ) = PHONE_COLLECTION_STATES[
             session.current_state
         ]
         return _resolve_phone_collection(
@@ -234,6 +372,8 @@ def resolve_next_state(session: CallSession, intent: Intent, transcript: str) ->
             awaiting_attr=awaiting_attr,
             value_attr=value_attr,
             success_state=success_state,
+            label=label,
+            total_digits=total_digits,
         )
 
     if session.current_state == State.COLLECT_PINCODE:

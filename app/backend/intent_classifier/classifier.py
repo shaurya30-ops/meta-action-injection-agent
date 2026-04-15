@@ -3,6 +3,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 import logging
 import threading
+from pathlib import Path
 from state_machine.intents import Intent
 import config
 
@@ -16,32 +17,87 @@ _worker_model = None
 _worker_tokenizer = None
 _worker_error = None
 
+
+def _resolve_base_model_source() -> str:
+    """
+    Prefer a locally cached Hugging Face snapshot so worker startup stays offline.
+    Fall back to the repo id if the cache is unavailable.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(config.BASE_MODEL_NAME, local_files_only=True)
+    except Exception as exc:
+        logger.warning(
+            "Local snapshot for base model unavailable (%s). Falling back to repo id %s.",
+            exc,
+            config.BASE_MODEL_NAME,
+        )
+        return config.BASE_MODEL_NAME
+
+
+def _is_local_source(source: str) -> bool:
+    return Path(source).exists()
+
+
+def _load_worker_tokenizer(adapter_path: str, base_model_source: str):
+    """
+    Try the adapter-packaged tokenizer first. If it is corrupted or incompatible,
+    fall back to the base Qwen tokenizer instead of failing the whole worker.
+    """
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(
+            adapter_path,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Adapter tokenizer load failed (%s). Falling back to base tokenizer from %s.",
+            exc,
+            base_model_source,
+        )
+        tokenizer_kwargs = {"trust_remote_code": True}
+        if not _is_local_source(base_model_source):
+            tokenizer_kwargs["local_files_only"] = False
+        return AutoTokenizer.from_pretrained(base_model_source, **tokenizer_kwargs)
+
+
 def _init_qwen_process(adapter_path: str):
     """Initializer for the background process. Loads PyTorch and PeftModel here."""
     global _worker_model, _worker_tokenizer, _worker_error
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM
         from peft import PeftModel
 
+        base_model_source = _resolve_base_model_source()
+        model_kwargs = {
+            "dtype": torch.bfloat16,
+            "device_map": "auto",
+            "trust_remote_code": True,
+        }
+        if not _is_local_source(base_model_source):
+            model_kwargs["local_files_only"] = False
+
         base_model = AutoModelForCausalLM.from_pretrained(
-            config.BASE_MODEL_NAME,
-            dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
+            base_model_source,
+            **model_kwargs,
         )
 
         _worker_model = PeftModel.from_pretrained(base_model, adapter_path)
         _worker_model.eval()
 
-        _worker_tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+        _worker_tokenizer = _load_worker_tokenizer(adapter_path, base_model_source)
         if _worker_tokenizer.pad_token is None:
             _worker_tokenizer.pad_token = _worker_tokenizer.eos_token
 
         # Warm up
         _run_qwen_inference("test")
-    except Exception as e:
-        _worker_error = str(e)
+    except Exception as exc:
+        _worker_error = str(exc)
 
 
 def _run_qwen_inference(transcript: str) -> str:
@@ -121,7 +177,10 @@ class IntentClassifier:
     def warmup(self):
         """Blocks until the process pool is fully initialized and warmed up."""
         pool = _get_global_pool(self.adapter_path)
-        pool.submit(_run_qwen_inference, "warmup_sync").result()
+        try:
+            pool.submit(_run_qwen_inference, "warmup_sync").result()
+        except Exception as e:
+            logger.error(f"Failed to load background classifier model (will use API fallback): {e}")
 
     async def classify(self, transcript: str) -> Intent:
         """
