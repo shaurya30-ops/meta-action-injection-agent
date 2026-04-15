@@ -497,10 +497,10 @@ async def entrypoint(ctx: JobContext):
         vad=silero.VAD.load(),
         stt=deepgram.STT(
             model="nova-3",
-            language="multi",
-            interim_results=True,
+            language="hi",
+            interim_results=False,
             endpointing_ms=300,
-            smart_format=True,
+            smart_format=False,
             punctuate=True,
         ),
         llm=openai.LLM(model="gpt-5.4-nano"),
