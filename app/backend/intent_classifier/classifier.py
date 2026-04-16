@@ -5,6 +5,7 @@ import logging
 import re
 import threading
 from pathlib import Path
+from content_extraction.extractor_logic import extract_digits
 from state_machine.intents import Intent
 import config
 
@@ -188,14 +189,28 @@ class IntentClassifier:
         if not normalized:
             return Intent.UNCLEAR
 
+        extracted_digits = extract_digits(normalized)
+        if extracted_digits:
+            return Intent.INFORM
+
         fallback_intent = self._fallback.classify(normalized)
         if fallback_intent == Intent.UNCLEAR:
+            if re.search(r"@|at the rate", normalized, re.IGNORECASE):
+                return Intent.INFORM
+            if re.search(
+                r"\b(?:setup|dealer|training|trade|distributor|retail|wholesaler|manufacturer|pharma|medical|business)\b",
+                normalized,
+                re.IGNORECASE,
+            ) and not re.search(
+                r"\b(?:kaise|kyun|kya|what|why|how|when|where|who|which|kitna|kitni|kitne|kaun)\b|क्या|कैसे|क्यों",
+                normalized,
+                re.IGNORECASE,
+            ):
+                return Intent.INFORM
             return None
 
         if fallback_intent == Intent.INFORM:
-            if re.search(r"\d{6,}", normalized):
-                return fallback_intent
-            if re.search(r"@|at the rate", normalized, re.IGNORECASE):
+            if extracted_digits or re.search(r"@|at the rate", normalized, re.IGNORECASE):
                 return fallback_intent
             return None
 

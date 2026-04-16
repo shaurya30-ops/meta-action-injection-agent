@@ -20,7 +20,7 @@ ACTION_MAP: dict[State, str | None] = {
     State.ASK_ALTERNATE_NUMBER: "क्या आप कोई alternate number भी देना चाहेंगे?",
     State.COLLECT_ALTERNATE_NUMBER: "{{alternate_collection_prompt}}",
     State.CONFIRM_ALTERNATE_NUMBER: "तो आपका alternate number है — {{spoken_alternate_digits}} — सही है?",
-    State.VERIFY_PINCODE: "आपका area pin code — {{spoken_crm_pincode}} — यही है?",
+    State.VERIFY_PINCODE: "{{verify_pincode_prompt}}",
     State.COLLECT_PINCODE: "{{pincode_collection_prompt}}",
     State.CONFIRM_PINCODE: "तो आपका pin code है — {{spoken_pincode_digits}} — सही है?",
     State.VERIFY_BUSINESS_DETAILS: (
@@ -29,7 +29,7 @@ ACTION_MAP: dict[State, str | None] = {
     State.CONFIRM_BUSINESS_DETAILS: (
         "तो आपका business type {{display_business_type}} है — और trade {{display_business_trade}} है — यही सही है?"
     ),
-    State.VERIFY_EMAIL: "आपकी email ID — {{spoken_crm_email}} — यही है?",
+    State.VERIFY_EMAIL: "{{verify_email_prompt}}",
     State.COLLECT_EMAIL_CORRECTION: "{{email_collection_prompt}}",
     State.CONFIRM_EMAIL_CORRECTION: "तो आपकी email ID — {{spoken_current_email}} — यही है?",
     State.ASK_PURCHASE_AMOUNT: "आप बता सकते हैं — आपने जो software purchase किया था, वो किस amount पर था?",
@@ -47,6 +47,7 @@ ACTION_MAP: dict[State, str | None] = {
     ),
     State.ANSWER_USER_QUERY: "{{query_response_prompt}}",
     State.PRE_CLOSING: None,
+    State.ASK_CALLBACK_TIME: "जी बिल्कुल. किस time या किस दिन call करना convenient रहेगा?",
     State.CALLBACK_CLOSING: "{{callback_closing_text}}",
     State.INVALID_REGISTRATION: "Marg में बने रहने के लिए आपका धन्यवाद. आपका दिन शुभ रहे.",
     State.WARM_CLOSING: "Marg में बने रहने के लिए आपका धन्यवाद. आपका दिन शुभ रहे.",

@@ -51,6 +51,20 @@ class IntentClassifierFastPathTests(unittest.TestCase):
 
     @patch("intent_classifier.classifier._get_global_pool")
     @patch("intent_classifier.classifier.asyncio.get_running_loop")
+    def test_spelled_digit_payload_uses_fast_path(
+        self,
+        mocked_get_running_loop,
+        _mocked_get_global_pool,
+    ):
+        classifier = IntentClassifier()
+
+        result = asyncio.run(classifier.classify("eight five two nine one five two one six eight"))
+
+        self.assertEqual(result, Intent.INFORM)
+        mocked_get_running_loop.assert_not_called()
+
+    @patch("intent_classifier.classifier._get_global_pool")
+    @patch("intent_classifier.classifier.asyncio.get_running_loop")
     def test_clarification_question_does_not_fast_path_to_affirm(
         self,
         mocked_get_running_loop,

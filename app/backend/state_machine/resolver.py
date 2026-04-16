@@ -12,6 +12,7 @@ from content_extraction.extractor_logic import (
     extract_and_store,
     extract_callback_phrase,
     extract_digits,
+    has_specific_callback_phrase,
     has_callback_request,
     looks_like_email_fragment,
     merge_spoken_email_fragments,
@@ -124,8 +125,19 @@ def _now() -> str:
 
 def _set_callback_closing(session: CallSession, transcript: str) -> State:
     session.callback_requested = True
-    session.callback_time_phrase = extract_callback_phrase(transcript)
-    session.callback_closing_text = build_callback_closing(transcript)
+    if session.current_state == State.ASK_CALLBACK_TIME:
+        normalized = " ".join(transcript.split())
+        session.callback_time_phrase = extract_callback_phrase(transcript) or normalized
+        if session.callback_time_phrase:
+            session.callback_closing_text = (
+                f"जी बिल्कुल, मैं आपको {session.callback_time_phrase} call करती हूँ। "
+                "Marg में बने रहने के लिए आपका धन्यवाद. आपका दिन शुभ रहे."
+            )
+        else:
+            session.callback_closing_text = build_callback_closing(transcript)
+    else:
+        session.callback_time_phrase = extract_callback_phrase(transcript)
+        session.callback_closing_text = build_callback_closing(transcript)
     return State.CALLBACK_CLOSING
 
 
@@ -201,10 +213,42 @@ def _build_collection_status_prompt(
     return f"अभी कोई digit load नहीं हुई है। कृपया पूरा {label} बताइए।"
 
 
+def _build_phone_collection_followup(
+    session: CallSession,
+    *,
+    label: str,
+    digits: str,
+    total_digits: int,
+    awaiting_confirmation: bool,
+) -> str:
+    if session.current_state == State.COLLECT_REFERRAL_NUMBER and session.referral_name:
+        if awaiting_confirmation and digits:
+            return (
+                f"अभी मैंने {session.referral_name} जी का referral number — {digits_to_tts(digits)} — load किया है। "
+                "अगर यही सही है तो हाँ कहिए, वरना दोबारा बताइए।"
+            )
+        if digits:
+            remaining = max(total_digits - len(digits), 0)
+            return (
+                f"अभी मैंने {session.referral_name} जी के referral number में {len(digits)} digit load की हैं — "
+                f"{digits_to_tts(digits)}। कुल {total_digits} digit चाहिए, बाकी {remaining} digit बताइए।"
+            )
+        return f"अभी मैंने {session.referral_name} जी का कोई number load नहीं किया है। कृपया पूरा contact number बताइए।"
+
+    return _build_collection_status_prompt(
+        label=label,
+        digits=digits,
+        total_digits=total_digits,
+        awaiting_confirmation=awaiting_confirmation,
+    )
+
+
 def _should_interrupt_for_query(session: CallSession, turn: TurnFrame) -> bool:
     if turn.query_type == "none":
         return False
     if session.current_state == State.ANSWER_USER_QUERY:
+        return False
+    if session.current_state == State.ASK_BILLING_STATUS and turn.workflow_answer in {"billing_started", "billing_not_started"}:
         return False
     if turn.workflow_answer == "collection_status_request":
         return False
@@ -256,6 +300,7 @@ def _build_response_prefix(
         return ""
 
     if next_state in {
+        State.ASK_CALLBACK_TIME,
         State.CALLBACK_CLOSING,
         State.INVALID_REGISTRATION,
         State.WARM_CLOSING,
@@ -270,7 +315,9 @@ def _build_response_prefix(
         return ""
 
     if previous_state == State.ASK_BILLING_STATUS and next_state == State.VERIFY_WHATSAPP:
-        return "ये तो अच्छी बात है."
+        if turn.workflow_answer == "billing_started":
+            return "ये तो अच्छी बात है."
+        return build_billing_blocker_support_prefix(session)
 
     if previous_state == State.EXPLORE_BILLING_BLOCKER and next_state == State.VERIFY_WHATSAPP:
         return build_billing_blocker_support_prefix(session)
@@ -279,9 +326,13 @@ def _build_response_prefix(
         return "जी, noted."
 
     if previous_state in {State.ASK_ALTERNATE_NUMBER, State.CONFIRM_ALTERNATE_NUMBER} and next_state == State.VERIFY_PINCODE:
+        if previous_state == State.CONFIRM_ALTERNATE_NUMBER and turn.workflow_answer == "digits_confirmed":
+            return "जी, noted."
         return "जी, कोई बात नहीं."
 
-    if previous_state == State.CONFIRM_PINCODE and next_state == State.VERIFY_BUSINESS_DETAILS:
+    if previous_state in {State.VERIFY_PINCODE, State.COLLECT_PINCODE, State.CONFIRM_PINCODE} and next_state == State.VERIFY_BUSINESS_DETAILS:
+        if turn.workflow_answer == "pincode_unknown":
+            return "जी, कोई बात नहीं — अगर अभी pin code याद नहीं है तो हम इसे बाद में update कर लेंगे."
         return "जी, समझ गई."
 
     if next_state == State.CONFIRM_BUSINESS_DETAILS and turn.workflow_answer == "business_details_corrected":
@@ -333,6 +384,8 @@ def _expected_slot_for_state(state: State) -> str:
         return "referral_number"
     if state == State.ANSWER_USER_QUERY:
         return "query_resolution"
+    if state == State.ASK_CALLBACK_TIME:
+        return "callback_time"
     if state in {
         State.PRE_CLOSING,
         State.REFERRAL_DECLINE_NUDGE,
@@ -397,7 +450,8 @@ def _resolve_phone_collection(
     total_digits: int,
 ) -> State:
     if intent == Intent.ASK and not extract_digits(transcript):
-        session.collection_followup_prompt = _build_collection_status_prompt(
+        session.collection_followup_prompt = _build_phone_collection_followup(
+            session,
             label=label,
             digits=getattr(session, buffer_attr),
             total_digits=total_digits,
@@ -551,14 +605,16 @@ def resolve_next_state(
         return State.WARM_CLOSING
 
     if session.current_state not in TERMINAL_OR_AUTO_STATES and turn.callback_request:
-        return _set_callback_closing(session, transcript)
+        if session.current_state == State.ASK_CALLBACK_TIME:
+            return _set_callback_closing(session, transcript)
+        if has_specific_callback_phrase(transcript):
+            return _set_callback_closing(session, transcript)
+        session.callback_requested = True
+        session.callback_time_phrase = ""
+        session.callback_closing_text = ""
+        return State.ASK_CALLBACK_TIME
 
     if session.current_state == State.ANSWER_USER_QUERY:
-        if turn.query_type != "none":
-            session.last_clarification_kind = turn.clarification_kind
-            session.last_user_query_type = turn.query_type
-            session.last_user_query_text = transcript
-            return State.ANSWER_USER_QUERY
         if session.query_resume_embedded and session.resume_state:
             resumed_state = session.resume_state
             resumed_turn = parse_turn(
@@ -573,6 +629,11 @@ def resolve_next_state(
                 return resolve_next_state(session, resumed_turn, transcript)
             finally:
                 session.current_state = original_state
+        if turn.query_type != "none":
+            session.last_clarification_kind = turn.clarification_kind
+            session.last_user_query_type = turn.query_type
+            session.last_user_query_text = transcript
+            return State.ANSWER_USER_QUERY
         if turn.wants_resume or intent in {Intent.AFFIRM, Intent.THANK}:
             return session.resume_state or State.ASK_BILLING_STATUS
         if intent in {Intent.DENY, Intent.ASK, Intent.REQUEST, Intent.UNCLEAR}:
@@ -599,13 +660,23 @@ def resolve_next_state(
     if session.current_state == State.ASK_BILLING_STATUS:
         if turn.workflow_answer == "billing_started":
             session.billing_started = "STARTED"
+            session.billing_blocker_reason = ""
             return State.VERIFY_WHATSAPP
         if turn.workflow_answer == "billing_not_started":
             session.billing_started = "NOT_STARTED"
+            session.billing_blocker_reason = detect_billing_blocker_reason(transcript)
+            session.last_blocker_reason = session.billing_blocker_reason
+            if session.billing_blocker_reason != "unknown":
+                return State.VERIFY_WHATSAPP
             return State.EXPLORE_BILLING_BLOCKER
 
     if session.current_state == State.EXPLORE_BILLING_BLOCKER:
+        session.billing_blocker_reason = detect_billing_blocker_reason(transcript)
+        session.last_blocker_reason = session.billing_blocker_reason
         return State.VERIFY_WHATSAPP
+
+    if session.current_state == State.ASK_CALLBACK_TIME:
+        return _set_callback_closing(session, transcript)
 
     if session.current_state == State.VERIFY_WHATSAPP:
         if turn.workflow_answer == "same_whatsapp":
@@ -618,6 +689,12 @@ def resolve_next_state(
             return State.VERIFY_PINCODE
         if turn.workflow_answer == "provide_alternate" and not turn.entities.digits:
             return State.COLLECT_ALTERNATE_NUMBER
+
+    if session.current_state == State.VERIFY_PINCODE and turn.workflow_answer == "pincode_unknown":
+        session.pincode = ""
+        session.pincode_digit_buffer = ""
+        session.awaiting_pincode_confirmation = False
+        return State.VERIFY_BUSINESS_DETAILS
 
     if session.current_state == State.VERIFY_PINCODE and extract_digits(transcript):
         session.pincode = ""
@@ -660,6 +737,15 @@ def resolve_next_state(
         ) = PHONE_COLLECTION_STATES[
             session.current_state
         ]
+        if turn.workflow_answer == "collection_status_request":
+            session.collection_followup_prompt = _build_phone_collection_followup(
+                session,
+                label=label,
+                digits=getattr(session, buffer_attr),
+                total_digits=total_digits,
+                awaiting_confirmation=getattr(session, awaiting_attr),
+            )
+            return session.current_state
         return _resolve_phone_collection(
             session,
             intent,
@@ -695,9 +781,27 @@ def resolve_next_state(
         )
 
     if session.current_state == State.COLLECT_PINCODE:
+        if turn.workflow_answer == "collection_status_request":
+            session.collection_followup_prompt = _build_collection_status_prompt(
+                label="pin code",
+                digits=session.pincode_digit_buffer,
+                total_digits=6,
+                awaiting_confirmation=session.awaiting_pincode_confirmation,
+            )
+            return State.COLLECT_PINCODE
+        if turn.workflow_answer == "pincode_unknown":
+            session.pincode = ""
+            session.pincode_digit_buffer = ""
+            session.awaiting_pincode_confirmation = False
+            return State.VERIFY_BUSINESS_DETAILS
         return _resolve_pincode_collection(session, intent, transcript)
 
     if session.current_state == State.CONFIRM_PINCODE:
+        if turn.workflow_answer == "pincode_unknown":
+            session.pincode = ""
+            session.pincode_digit_buffer = ""
+            session.awaiting_pincode_confirmation = False
+            return State.VERIFY_BUSINESS_DETAILS
         return _resolve_pincode_confirmation(session, intent, transcript)
 
     if session.current_state == State.VERIFY_BUSINESS_DETAILS:

@@ -152,6 +152,31 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(session.callback_time_phrase, "पांच minute बाद")
         self.assertIn("पांच minute बाद", session.callback_closing_text)
 
+    def test_callback_without_specific_time_asks_for_schedule_first(self):
+        session = CallSession(current_state=State.CHECK_AVAILABILITY)
+
+        next_state = self.advance(
+            session,
+            Intent.DEFER,
+            "नहीं आप बाद में call करो.",
+        )
+
+        self.assertEqual(next_state, State.ASK_CALLBACK_TIME)
+        self.assertEqual(session.current_state, State.ASK_CALLBACK_TIME)
+        self.assertEqual(
+            build_action_text(session),
+            "जी बिल्कुल. किस time या किस दिन call करना convenient रहेगा?",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "कल सुबह 11 बजे.",
+        )
+
+        self.assertEqual(next_state, State.CALLBACK_CLOSING)
+        self.assertIn("कल सुबह 11 बजे", session.callback_closing_text)
+
     def test_whatsapp_buffer_moves_to_confirm_state_after_ten_digits(self):
         session = CallSession(current_state=State.COLLECT_WHATSAPP_NUMBER)
 
@@ -242,6 +267,42 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(session.current_state, State.CONFIRM_PINCODE)
         self.assertEqual(session.pincode_digit_buffer, "110012")
         self.assertTrue(session.awaiting_pincode_confirmation)
+
+    def test_billing_setup_in_progress_moves_forward_with_guidance(self):
+        session = CallSession(current_state=State.ASK_BILLING_STATUS)
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "नहीं अभी setup ही कर रहा हूं.",
+        )
+
+        self.assertEqual(next_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.current_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.billing_started, "NOT_STARTED")
+        self.assertEqual(session.billing_blocker_reason, "setup_in_progress")
+        rendered = build_action_text(session)
+        self.assertIn("setup पूरा होने", rendered)
+        self.assertIn("WhatsApp", rendered)
+
+    def test_embedded_query_resume_accepts_billing_started_without_reasking(self):
+        session = CallSession(
+            current_state=State.ANSWER_USER_QUERY,
+            resume_state=State.ASK_BILLING_STATUS,
+            query_resume_embedded=True,
+            query_resolution_pending=True,
+            last_user_query_type="clarification",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "हां setup हो गया है, billing start हो गई है.",
+        )
+
+        self.assertEqual(next_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.current_state, State.VERIFY_WHATSAPP)
+        self.assertIsNone(session.resume_state)
 
     def test_business_detail_correction_stays_in_confirmation_cluster(self):
         session = CallSession(
@@ -357,6 +418,41 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertFalse(session.query_resume_embedded)
         self.assertIsNone(session.resume_state)
 
+    def test_confirmed_alternate_number_does_not_use_no_problem_prefix(self):
+        session = CallSession(
+            current_state=State.CONFIRM_ALTERNATE_NUMBER,
+            alternate_digit_buffer="8529152168",
+            awaiting_alternate_confirmation=True,
+        )
+
+        next_state = self.advance(session, Intent.AFFIRM, "हाँ")
+
+        self.assertEqual(next_state, State.VERIFY_PINCODE)
+        rendered = build_action_text(session)
+        self.assertIn("noted", rendered)
+        self.assertNotIn("कोई बात नहीं", rendered)
+
+    def test_missing_crm_pincode_renders_gentle_fresh_prompt(self):
+        session = CallSession(current_state=State.VERIFY_PINCODE)
+
+        rendered = build_action_text(session)
+
+        self.assertIn("pin code available नहीं दिख रहा", rendered)
+        self.assertIn("अपना area pin code बता दीजिए", rendered)
+
+    def test_pincode_unknown_skips_forward_with_empathy(self):
+        session = CallSession(current_state=State.VERIFY_PINCODE)
+
+        next_state = self.advance(
+            session,
+            Intent.DENY,
+            "जी मुझे नहीं पता.",
+        )
+
+        self.assertEqual(next_state, State.VERIFY_BUSINESS_DETAILS)
+        rendered = build_action_text(session)
+        self.assertIn("अगर अभी pin code याद नहीं है", rendered)
+
     def test_referral_clarification_prompt_reads_back_recorded_detail(self):
         session = CallSession(
             current_state=State.ANSWER_USER_QUERY,
@@ -391,6 +487,62 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(session.resume_state, State.CONFIRM_REFERRAL_NUMBER)
         self.assertEqual(session.last_user_query_type, "clarification")
 
+    def test_referral_collection_status_reads_back_loaded_digits_and_name(self):
+        session = CallSession(
+            current_state=State.COLLECT_REFERRAL_NUMBER,
+            referral_name="शौर्य",
+            referral_digit_buffer="85291521",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.ASK,
+            "कहाँ तक लिखा है आपने?",
+        )
+
+        self.assertEqual(next_state, State.COLLECT_REFERRAL_NUMBER)
+        rendered = build_action_text(session)
+        self.assertIn("शौर्य", rendered)
+        self.assertIn("8 digit load", rendered)
+        self.assertIn("eight five two nine one five two one", rendered)
+
+    def test_referral_meta_reply_keeps_existing_name_and_reads_status(self):
+        session = CallSession(
+            current_state=State.COLLECT_REFERRAL_NUMBER,
+            referral_name="शौर्य",
+            referral_digit_buffer="85291521",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "बताया तो ma'am दस number.",
+        )
+
+        self.assertEqual(next_state, State.COLLECT_REFERRAL_NUMBER)
+        self.assertEqual(session.referral_name, "शौर्य")
+        rendered = build_action_text(session)
+        self.assertIn("शौर्य", rendered)
+        self.assertIn("बाकी 2 digit", rendered)
+
+    def test_referral_name_clarification_answers_name_without_pollution(self):
+        session = CallSession(
+            current_state=State.COLLECT_REFERRAL_NUMBER,
+            referral_name="शौर्य",
+            referral_digit_buffer="85291521",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.ASK,
+            "Referral वाले का नाम क्या लिखा है आपने?",
+        )
+
+        self.assertEqual(next_state, State.ANSWER_USER_QUERY)
+        rendered = build_action_text(session)
+        self.assertIn("नाम शौर्य जी", rendered)
+        self.assertNotIn("दस जी", rendered)
+
 
 class PromptRenderingTests(unittest.TestCase):
     def test_build_action_text_preserves_exact_rendered_dialogue(self):
@@ -418,6 +570,14 @@ class PromptRenderingTests(unittest.TestCase):
             rendered,
             "तो आपकी email ID — utkarsh dot soni at the rate gmail dot com — यही है?",
         )
+
+    def test_build_action_text_handles_missing_crm_email_gracefully(self):
+        session = CallSession(current_state=State.VERIFY_EMAIL)
+
+        rendered = build_action_text(session)
+
+        self.assertIn("email ID available नहीं दिख रही", rendered)
+        self.assertIn("अपनी email ID बता दीजिए", rendered)
 
 
 class DispositionTests(unittest.TestCase):

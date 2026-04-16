@@ -31,6 +31,8 @@ class RegexFallbackClassifier:
             r"\u092e\u093f\u0932\u0924\u0947\s+\u0939\u0948\u0902",
             r"\u091a\u0932\u0924\u0947\s+\u0939\u0948\u0902",
             r"\u091a\u0932\u094b\s+\u092b\u093f\u0930",
+            r"\u0930\u0939\u0928\u0947\s+\u0926\u094b", r"rehne\s+do",
+            r"\u091b\u094b\u0921\u093c\u094b", r"chhodo",
             r"tata\b", r"good\s*bye",
         ]),
 

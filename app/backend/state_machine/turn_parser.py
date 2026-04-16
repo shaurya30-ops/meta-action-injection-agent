@@ -227,6 +227,10 @@ _CLOSURE_PATTERNS = [
     r"चलो ठीक है",
     r"रखता हूँ",
     r"रखती हूँ",
+    r"रहने दो",
+    r"rehne do",
+    r"छोड़ो",
+    r"chhodo",
 ]
 
 _NOT_STARTED_PATTERNS = [
@@ -243,9 +247,16 @@ _NOT_STARTED_PATTERNS = [
 _COLLECTION_STATUS_PATTERNS = [
     r"कहाँ तक load",
     r"कहां तक load",
+    "\u0915\u0939\u093e\u0901 \u0924\u0915 \u0932\u093f\u0916\u093e",
+    "\u0915\u0939\u093e\u0902 \u0924\u0915 \u0932\u093f\u0916\u093e",
     r"kitna load",
-    r"कितनी digit",
-    r"कितना हुआ",
+    "\u0915\u093f\u0924\u0928\u093e \u0932\u093f\u0916\u093e",
+    "\u0915\u094d\u092f\u093e note",
+    "\u0915\u094d\u092f\u093e \u0928\u094b\u091f",
+    "\u0915\u093f\u0924\u0928\u0940 digit",
+    "\u0915\u093f\u0924\u0928\u093e \u0939\u0941\u0906",
+    "\u0926\u0938 number",
+    "\u092a\u0942\u0930\u093e number",
 ]
 
 
@@ -311,6 +322,13 @@ def detect_affect(transcript: str, speech_act: Intent, query_type: str) -> str:
 
 def detect_billing_blocker_reason(transcript: str) -> str:
     lowered = transcript.lower()
+    if re.search(
+        "setup\\s+\u0939\u0940\\s+\u0915\u0930|abhi\\s+setup|setup\\s+\u0928\u0939\u0940\u0902\\s+\u0915\u093f\u092f\u093e|setup\\s+ho\\s+raha|"
+        "setup\\s+kar\\s+raha|\u0932\u095c\u0915\u093e\\s+\u092c\u093e\u0939\u0930|ladka\\s+bahar|engineer\\s+\u092c\u093e\u0939\u0930|\u092c\u093e\u0939\u0930\\s+\u0939\u0948",
+        lowered,
+        re.IGNORECASE,
+    ):
+        return "setup_in_progress"
     if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in _TECHNICAL_PATTERNS):
         return "technical_issue"
     if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in _DEALER_SETUP_PATTERNS):
@@ -377,6 +395,13 @@ def map_workflow_answer(
             return "no_alternate"
 
     if state == State.VERIFY_PINCODE:
+        if re.search(
+            "\u092e\u0941\u091d\u0947 \u0928\u0939\u0940\u0902 \u092a\u0924\u093e|\u092a\u0924\u093e \u0928\u0939\u0940\u0902|"
+            "\u092f\u093e\u0926 \u0928\u0939\u0940\u0902|maloom nahi|pata nahi|yaad nahi",
+            lowered,
+            re.IGNORECASE,
+        ):
+            return "pincode_unknown"
         if entities.digits or speech_act in {Intent.DENY, Intent.INFORM, Intent.ELABORATE, Intent.REQUEST, Intent.OBJECT}:
             return "corrected_pincode"
         if speech_act in {Intent.AFFIRM, Intent.THANK}:
@@ -444,6 +469,14 @@ def map_workflow_answer(
     if state == State.COLLECT_REFERRAL_NAME:
         if entities.referral_name:
             return "referral_name_provided"
+
+    if state in {State.COLLECT_PINCODE, State.CONFIRM_PINCODE} and re.search(
+        "\u092e\u0941\u091d\u0947 \u0928\u0939\u0940\u0902 \u092a\u0924\u093e|\u092a\u0924\u093e \u0928\u0939\u0940\u0902|"
+        "\u092f\u093e\u0926 \u0928\u0939\u0940\u0902|maloom nahi|pata nahi|yaad nahi",
+        lowered,
+        re.IGNORECASE,
+    ):
+        return "pincode_unknown"
 
     if state in {
         State.COLLECT_WHATSAPP_NUMBER,
