@@ -16,7 +16,8 @@ from state_machine.intents import Intent
 from state_machine.resolver import post_transition, resolve_next_state
 from state_machine.session import CallSession
 from state_machine.states import State
-from state_machine.transitions import TRANSITIONS
+from state_machine.turn_parser import parse_turn
+from state_machine.transitions import AUTO_TRANSITIONS, TRANSITIONS
 from utils.transcript import sanitize_user_transcript
 
 
@@ -35,6 +36,12 @@ class RegexFallbackClassifierTests(unittest.TestCase):
         self.assertEqual(
             self.classifier.classify("जी आप मुझे पांच minute बाद call करो."),
             Intent.DEFER,
+        )
+
+    def test_hindi_clarification_question_is_ask(self):
+        self.assertEqual(
+            self.classifier.classify("हां जी उसका नाम क्या लिखा आपने?"),
+            Intent.ASK,
         )
 
 
@@ -90,21 +97,29 @@ class StrictFlowTransitionTests(unittest.TestCase):
             State.ASK_BILLING_STATUS,
         )
 
-    def test_verification_chain_keeps_required_order(self):
+    def test_verification_chain_uses_explicit_confirmation_states(self):
         self.assertEqual(
             TRANSITIONS[(State.VERIFY_WHATSAPP, Intent.DENY)],
             State.COLLECT_WHATSAPP_NUMBER,
         )
         self.assertEqual(
-            TRANSITIONS[(State.ASK_ALTERNATE_NUMBER, Intent.DENY)],
-            State.VERIFY_PINCODE,
+            TRANSITIONS[(State.CONFIRM_WHATSAPP_NUMBER, Intent.AFFIRM)],
+            State.ASK_ALTERNATE_NUMBER,
         )
         self.assertEqual(
-            TRANSITIONS[(State.VERIFY_EMAIL, Intent.AFFIRM)],
-            State.ASK_PURCHASE_AMOUNT,
+            TRANSITIONS[(State.CONFIRM_PINCODE, Intent.AFFIRM)],
+            State.VERIFY_BUSINESS_DETAILS,
         )
         self.assertEqual(
             TRANSITIONS[(State.SUPPORT_AND_REFERRAL, Intent.DENY)],
+            State.REFERRAL_DECLINE_NUDGE,
+        )
+        self.assertEqual(
+            TRANSITIONS[(State.VERIFY_EMAIL, Intent.DENY)],
+            State.COLLECT_EMAIL_CORRECTION,
+        )
+        self.assertEqual(
+            AUTO_TRANSITIONS[State.PRE_CLOSING],
             State.WARM_CLOSING,
         )
 
@@ -114,6 +129,14 @@ class ResolverFlowTests(unittest.TestCase):
         next_state = resolve_next_state(session, intent, transcript)
         post_transition(session, intent, transcript, next_state)
         return next_state
+
+    def test_opening_affirm_with_question_mark_does_not_trigger_query_mode(self):
+        session = CallSession(current_state=State.OPENING_GREETING)
+
+        next_state = self.advance(session, Intent.AFFIRM, "हाँ जी हो रही है?")
+
+        self.assertEqual(next_state, State.CHECK_AVAILABILITY)
+        self.assertEqual(session.current_state, State.CHECK_AVAILABILITY)
 
     def test_callback_request_closes_immediately_and_mirrors_time(self):
         session = CallSession(current_state=State.CHECK_AVAILABILITY)
@@ -129,7 +152,7 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(session.callback_time_phrase, "पांच minute बाद")
         self.assertIn("पांच minute बाद", session.callback_closing_text)
 
-    def test_whatsapp_buffer_confirms_only_after_ten_digits(self):
+    def test_whatsapp_buffer_moves_to_confirm_state_after_ten_digits(self):
         session = CallSession(current_state=State.COLLECT_WHATSAPP_NUMBER)
 
         self.advance(session, Intent.INFORM, "one two three four")
@@ -142,7 +165,7 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertFalse(session.awaiting_whatsapp_confirmation)
 
         self.advance(session, Intent.INFORM, "nine zero")
-        self.assertEqual(session.current_state, State.COLLECT_WHATSAPP_NUMBER)
+        self.assertEqual(session.current_state, State.CONFIRM_WHATSAPP_NUMBER)
         self.assertEqual(session.whatsapp_digit_buffer, "1234567890")
         self.assertTrue(session.awaiting_whatsapp_confirmation)
 
@@ -192,7 +215,7 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertIn("4 digit load", context["alternate_collection_prompt"])
         self.assertIn("कुल 10 digit", context["alternate_collection_prompt"])
 
-    def test_direct_alternate_digits_are_captured_on_ask_state(self):
+    def test_direct_alternate_digits_can_skip_to_confirm_state(self):
         session = CallSession(current_state=State.ASK_ALTERNATE_NUMBER)
 
         next_state = self.advance(
@@ -201,8 +224,8 @@ class ResolverFlowTests(unittest.TestCase):
             "alternate number 9876543210",
         )
 
-        self.assertEqual(next_state, State.COLLECT_ALTERNATE_NUMBER)
-        self.assertEqual(session.current_state, State.COLLECT_ALTERNATE_NUMBER)
+        self.assertEqual(next_state, State.CONFIRM_ALTERNATE_NUMBER)
+        self.assertEqual(session.current_state, State.CONFIRM_ALTERNATE_NUMBER)
         self.assertEqual(session.alternate_digit_buffer, "9876543210")
         self.assertTrue(session.awaiting_alternate_confirmation)
 
@@ -215,10 +238,158 @@ class ResolverFlowTests(unittest.TestCase):
             "नहीं दूसरा pin code है one one zero zero one two.",
         )
 
-        self.assertEqual(next_state, State.COLLECT_PINCODE)
-        self.assertEqual(session.current_state, State.COLLECT_PINCODE)
+        self.assertEqual(next_state, State.CONFIRM_PINCODE)
+        self.assertEqual(session.current_state, State.CONFIRM_PINCODE)
         self.assertEqual(session.pincode_digit_buffer, "110012")
         self.assertTrue(session.awaiting_pincode_confirmation)
+
+    def test_business_detail_correction_stays_in_confirmation_cluster(self):
+        session = CallSession(
+            current_state=State.VERIFY_BUSINESS_DETAILS,
+            crm_business_type="Medical",
+            crm_business_trade="Retailer",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "नहीं, business type pharma है और trade wholesaler है.",
+        )
+
+        self.assertEqual(next_state, State.CONFIRM_BUSINESS_DETAILS)
+        self.assertEqual(session.current_state, State.CONFIRM_BUSINESS_DETAILS)
+        self.assertEqual(session.business_type, "Pharma")
+        self.assertEqual(session.business_trade, "Wholesaler")
+
+    def test_email_correction_requires_confirmation(self):
+        session = CallSession(
+            current_state=State.VERIFY_EMAIL,
+            crm_email="old@example.com",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "नई, मेरी email है utkarsh dot soni at the rate gmail dot com",
+        )
+
+        self.assertEqual(next_state, State.CONFIRM_EMAIL_CORRECTION)
+        self.assertEqual(session.current_state, State.CONFIRM_EMAIL_CORRECTION)
+        self.assertEqual(session.email, "utkarsh.soni@gmail.com")
+
+    def test_split_email_correction_is_buffered_across_turns(self):
+        session = CallSession(
+            current_state=State.VERIFY_EMAIL,
+            crm_email="old@example.com",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "नहीं, उत्कर्ष one two",
+        )
+
+        self.assertEqual(next_state, State.COLLECT_EMAIL_CORRECTION)
+        self.assertEqual(session.current_state, State.COLLECT_EMAIL_CORRECTION)
+        self.assertEqual(session.email_fragment_buffer, "नहीं, उत्कर्ष one two")
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "four at the rate Gmail dot com.",
+        )
+
+        self.assertEqual(next_state, State.CONFIRM_EMAIL_CORRECTION)
+        self.assertEqual(session.current_state, State.CONFIRM_EMAIL_CORRECTION)
+        self.assertEqual(session.email, "उत्कर्ष124@gmail.com")
+
+        rendered = build_action_text(session)
+        self.assertIn(
+            "उत्कर्ष one two four at the rate gmail dot com",
+            rendered,
+        )
+
+    def test_query_interrupts_and_resumes_same_workflow_step(self):
+        session = CallSession(current_state=State.VERIFY_PINCODE, crm_pincode="110011")
+
+        next_state = self.advance(
+            session,
+            Intent.ASK,
+            "renewal का charge कितना होगा?",
+        )
+
+        self.assertEqual(next_state, State.ANSWER_USER_QUERY)
+        self.assertEqual(session.current_state, State.ANSWER_USER_QUERY)
+        self.assertEqual(session.resume_state, State.VERIFY_PINCODE)
+        self.assertEqual(session.last_user_query_type, "pricing")
+        self.assertEqual(session.dialog_mode, "HANDLE_QUERY")
+        self.assertEqual(session.expected_slot, "query_resolution")
+
+        resumed_state = self.advance(session, Intent.AFFIRM, "हाँ clear है")
+        self.assertEqual(resumed_state, State.VERIFY_PINCODE)
+        self.assertEqual(session.current_state, State.VERIFY_PINCODE)
+        self.assertIsNone(session.resume_state)
+        self.assertEqual(session.expected_slot, "pincode")
+
+    def test_clarification_reasks_step_and_accepts_direct_answer(self):
+        session = CallSession(current_state=State.ASK_BILLING_STATUS)
+
+        next_state = self.advance(
+            session,
+            Intent.ASK,
+            "billing से आपका क्या मतलब है?",
+        )
+
+        self.assertEqual(next_state, State.ANSWER_USER_QUERY)
+        self.assertTrue(session.query_resume_embedded)
+        self.assertEqual(session.resume_state, State.ASK_BILLING_STATUS)
+        self.assertEqual(session.expected_slot, "billing_status")
+
+        clarification_text = build_action_text(session)
+        self.assertEqual(
+            clarification_text,
+            "जी, मेरा मतलब था — क्या आपने software में billing या invoice बनाना start किया है?",
+        )
+
+        resumed_state = self.advance(session, Intent.AFFIRM, "हाँ हो गई है.")
+        self.assertEqual(resumed_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.current_state, State.VERIFY_WHATSAPP)
+        self.assertFalse(session.query_resume_embedded)
+        self.assertIsNone(session.resume_state)
+
+    def test_referral_clarification_prompt_reads_back_recorded_detail(self):
+        session = CallSession(
+            current_state=State.ANSWER_USER_QUERY,
+            resume_state=State.CONFIRM_REFERRAL_NUMBER,
+            last_user_query_type="clarification",
+            last_clarification_kind="recorded_value",
+            referral_name="राहुल",
+            referral_digit_buffer="9876543210",
+        )
+
+        rendered = build_action_text(session)
+
+        self.assertIn("मैंने नाम राहुल जी note किया है", rendered)
+        self.assertIn("nine eight seven six five four three two one zero", rendered)
+        self.assertTrue(rendered.endswith("क्या यही सही है?"))
+
+    def test_confirm_referral_question_interrupts_instead_of_closing(self):
+        session = CallSession(
+            current_state=State.CONFIRM_REFERRAL_NUMBER,
+            referral_digit_buffer="9876543210",
+            awaiting_referral_confirmation=True,
+            referral_name="राहुल",
+        )
+        transcript = "हां जी उसका नाम क्या लिखा आपने?"
+        turn = parse_turn(session, Intent.ASK, transcript)
+
+        next_state = resolve_next_state(session, turn, transcript)
+        post_transition(session, turn, transcript, next_state)
+
+        self.assertEqual(next_state, State.ANSWER_USER_QUERY)
+        self.assertEqual(session.current_state, State.ANSWER_USER_QUERY)
+        self.assertEqual(session.resume_state, State.CONFIRM_REFERRAL_NUMBER)
+        self.assertEqual(session.last_user_query_type, "clarification")
 
 
 class PromptRenderingTests(unittest.TestCase):
@@ -233,6 +404,19 @@ class PromptRenderingTests(unittest.TestCase):
         self.assertEqual(
             rendered,
             "आपका area pin code — one one zero zero one one — यही है?",
+        )
+
+    def test_build_action_text_renders_corrected_email_confirmation(self):
+        session = CallSession(
+            current_state=State.CONFIRM_EMAIL_CORRECTION,
+            email="utkarsh.soni@gmail.com",
+        )
+
+        rendered = build_action_text(session)
+
+        self.assertEqual(
+            rendered,
+            "तो आपकी email ID — utkarsh dot soni at the rate gmail dot com — यही है?",
         )
 
 

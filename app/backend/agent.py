@@ -35,6 +35,7 @@ from state_machine.actions import ACTION_MAP
 from state_machine.transitions import AUTO_TRANSITIONS
 from state_machine.resolver import resolve_next_state, post_transition, execute_auto_chain
 from state_machine.programmatic import resolve_programmatic
+from state_machine.turn_parser import parse_turn
 from intent_classifier.classifier import IntentClassifier
 from prompts.payload_builder import build_action_text
 from prompts.template_renderer import render_template
@@ -383,15 +384,16 @@ class आकृतिAgent(Agent):
         # ── STAGE 2: CLASSIFY INTENT ──
         pipeline_logger.start("CLASSIFY")
         intent = await self.classifier.classify(latest_transcript)
+        turn = parse_turn(self.session_data, intent, latest_transcript)
         classify_ms = pipeline_logger.end("CLASSIFY", intent=intent.value)
 
         # ── STAGE 3: STATE MACHINE TRANSITION ──
         pipeline_logger.start("TRANSITION")
         prev_state = self.session_data.current_state
-        next_state = resolve_next_state(self.session_data, intent, latest_transcript)
+        next_state = resolve_next_state(self.session_data, turn, latest_transcript)
 
         # ── STAGE 3.5: POST-TRANSITION HOOKS ──
-        post_transition(self.session_data, intent, latest_transcript, next_state)
+        post_transition(self.session_data, turn, latest_transcript, next_state)
         pipeline_logger.end("TRANSITION")
         pipeline_logger.log_transition(prev_state.value, intent.value, next_state.value)
 
@@ -436,6 +438,13 @@ class आकृतिAgent(Agent):
                     "state": self.session_data.current_state.value,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 })
+                if self.session_data.current_state in {
+                    State.CALLBACK_CLOSING,
+                    State.INVALID_REGISTRATION,
+                    State.WARM_CLOSING,
+                }:
+                    self.session_data.closing_emitted = True
+                    self.session_data.hard_stop_after_closing = True
 
         # ── TERMINAL STATE: End call ──
         if self.session_data.current_state == State.END:

@@ -25,6 +25,7 @@ class CallSession:
     business_trade: str = ""
     business_type: str = ""
     email: str = ""
+    email_fragment_buffer: str = ""
     purchase_amount: str = ""
     referral_name: str = ""
     referral_number: str = ""
@@ -44,6 +45,27 @@ class CallSession:
     callback_closing_text: str = ""
     closing_emitted: bool = False
     collection_followup_prompt: str = ""
+    pending_response_prefix: str = ""
+
+    dialog_mode: str = "NORMAL"
+    affect_state: str = "NEUTRAL"
+    resume_state: Optional[State] = None
+    resume_reason: str = ""
+    expected_slot: str = ""
+    last_user_query_type: str = "none"
+    last_user_query_text: str = ""
+    last_clarification_kind: str = "none"
+    last_turn_workflow_answer: str = "unknown"
+    last_blocker_reason: str = ""
+    billing_blocker_reason: str = ""
+    busy_but_continuing: bool = False
+    user_disengagement_count: int = 0
+    query_resolution_pending: bool = False
+    business_correction_pending: bool = False
+    email_correction_pending: bool = False
+    referral_declined_once: bool = False
+    query_resume_embedded: bool = False
+    hard_stop_after_closing: bool = False
 
     transcript: list = field(default_factory=list)
 

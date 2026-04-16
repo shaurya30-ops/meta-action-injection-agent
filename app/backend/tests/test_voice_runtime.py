@@ -49,13 +49,29 @@ class IntentClassifierFastPathTests(unittest.TestCase):
         self.assertEqual(result, Intent.INFORM)
         mocked_get_running_loop.assert_not_called()
 
+    @patch("intent_classifier.classifier._get_global_pool")
+    @patch("intent_classifier.classifier.asyncio.get_running_loop")
+    def test_clarification_question_does_not_fast_path_to_affirm(
+        self,
+        mocked_get_running_loop,
+        _mocked_get_global_pool,
+    ):
+        classifier = IntentClassifier()
+
+        result = asyncio.run(classifier.classify("हां जी उसका नाम क्या लिखा आपने?"))
+
+        self.assertEqual(result, Intent.ASK)
+        mocked_get_running_loop.assert_not_called()
+
 
 class VoiceSessionConfigTests(unittest.TestCase):
-    def test_turn_handling_prefers_stt_and_short_interruptions(self):
+    def test_turn_handling_prefers_vad_and_short_interruptions(self):
         turn_handling = build_turn_handling_options()
 
-        self.assertEqual(turn_handling["turn_detection"], "stt")
+        self.assertEqual(turn_handling["turn_detection"], "vad")
         self.assertEqual(turn_handling["endpointing"]["mode"], "fixed")
+        self.assertEqual(turn_handling["endpointing"]["min_delay"], 0.45)
+        self.assertEqual(turn_handling["endpointing"]["max_delay"], 1.8)
         self.assertEqual(turn_handling["interruption"]["mode"], "vad")
         self.assertFalse(turn_handling["interruption"]["discard_audio_if_uninterruptible"])
         self.assertEqual(turn_handling["interruption"]["min_duration"], 0.25)

@@ -113,6 +113,25 @@ class RegexFallbackClassifier:
             r"^\u0930\u093e\u092e\s+\u0930\u093e\u092e",
         ]),
 
+        # -- ASK: Clarification / information-seeking questions --
+        (Intent.ASK, [
+            r"\u0915\u094d\u092f\u093e\s+\u0932\u093f\u0916\u093e",
+            r"\u0915\u094d\u092f\u093e\s+\u092c\u094b\u0932\u093e",
+            r"\u0915\u094d\u092f\u093e\s+\u0915\u0939\u093e",
+            r"\u0928\u093e\u092e\s+\u0915\u094d\u092f\u093e",
+            r"kya\s+likha",
+            r"kya\s+bola",
+            r"kya\s+kaha",
+            r"naam\s+kya",
+            r"\b(?:kaise|kyun|kya|what|why|how|when|where|who|which|kitna|kitni|kitne|kaun)\b",
+            r"\u0915\u094c\u0928",
+            r"\u0915\u0948\u0938\u0947",
+            r"\u0915\u094d\u092f\u094b\u0902",
+            r"\u0915\u093f\u0924\u0928\u093e",
+            r"\u0915\u093f\u0924\u0928\u0940",
+            r"\u0915\u093f\u0924\u0928\u0947",
+        ]),
+
         # ── AFFIRM: Short positive responses ONLY ──
         (Intent.AFFIRM, [
             r"^\u0939\u093e\u0902", r"^\u091c\u0940",
