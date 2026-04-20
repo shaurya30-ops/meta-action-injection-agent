@@ -43,6 +43,7 @@ from content_extraction.extractor_logic import build_render_context
 from dispositions.resolver import compute_disposition
 from dispositions.logger import log_call
 from utils.logger import pipeline_logger, log_metric
+from telephony.sip import extract_sip_attrs, lookup_crm_by_phone
 from utils.stable_sarvam import StableSarvamTTS
 from utils.transcript import sanitize_user_transcript
 from utils.voice_session import (
@@ -268,12 +269,32 @@ async def _resolve_crm_data(
 def combine_chain_actions(chain: list[State], session_data: CallSession) -> str:
     """Combine ACTION_MAP entries for an auto-advance chain into one directive."""
     combined = []
+    final_state = session_data.current_state
     for state in chain:
         action = ACTION_MAP.get(state)
         if action:
+            session_data.current_state = state
             rendered = render_template(action, build_render_context(session_data))
-            combined.append(rendered)
+            if rendered.strip():
+                combined.append(rendered)
+    session_data.current_state = final_state
     return "\n".join(combined)
+
+
+def prepare_direct_action(session_data: CallSession) -> tuple[str | None, State | None]:
+    current = session_data.current_state
+
+    if current in AUTO_TRANSITIONS:
+        chain = execute_auto_chain(session_data, current)
+        pipeline_logger.log_auto_chain(chain)
+        if not chain:
+            return None, None
+        return combine_chain_actions(chain, session_data), chain[-1]
+
+    action = ACTION_MAP.get(current)
+    if not action:
+        return None, None
+    return render_template(action, build_render_context(session_data)), current
 
 
 class आकृतिAgent(Agent):
@@ -405,20 +426,10 @@ class आकृतिAgent(Agent):
             current = self.session_data.current_state
             logger.info(f"[PROGRAMMATIC] Resolved to {current.value}")
 
-        # Handle auto-advance chains
-        if current in AUTO_TRANSITIONS:
-            chain = execute_auto_chain(self.session_data, current)
-            combined_action = combine_chain_actions(chain, self.session_data)
-            pipeline_logger.log_auto_chain(chain)
-        else:
-            action = ACTION_MAP.get(self.session_data.current_state)
-            if action:
-                combined_action = render_template(action, build_render_context(self.session_data))
-            else:
-                combined_action = None
+        combined_action, render_state = prepare_direct_action(self.session_data)
 
         # ── STAGE 5: DIRECT RENDER ──
-        if combined_action and self.session_data.current_state != State.END:
+        if combined_action and render_state is not None:
             direct_response = build_action_text(
                 self.session_data,
                 action_override=combined_action,
@@ -427,7 +438,7 @@ class आकृतिAgent(Agent):
                 pipeline_logger.start("RENDER")
                 logger.info(
                     "[DIRECT_RENDER] state=%s text=%s",
-                    self.session_data.current_state.value,
+                    render_state.value,
                     direct_response,
                 )
                 yield direct_response
@@ -435,13 +446,11 @@ class आकृतिAgent(Agent):
                 self.session_data.transcript.append({
                     "role": "agent",
                     "text": direct_response,
-                    "state": self.session_data.current_state.value,
+                    "state": render_state.value,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 })
-                if self.session_data.current_state in {
-                    State.CALLBACK_CLOSING,
-                    State.INVALID_REGISTRATION,
-                    State.WARM_CLOSING,
+                if render_state in {
+                    State.FIXED_CLOSING,
                 }:
                     self.session_data.closing_emitted = True
                     self.session_data.hard_stop_after_closing = True
@@ -468,7 +477,6 @@ class आकृतिAgent(Agent):
             logger.error(f"Disconnect error: {e}")
 
 
-
 # ══════════════════════════════════════════════════════════════════════
 # LIVEKIT WORKER SETUP
 # ══════════════════════════════════════════════════════════════════════
@@ -476,7 +484,7 @@ class आकृतिAgent(Agent):
 async def entrypoint(ctx: JobContext):
     """LiveKit room session entrypoint."""
     await ctx.connect()
-    
+
     try:
         participant = await asyncio.wait_for(
             ctx.wait_for_participant(), timeout=30
@@ -485,9 +493,43 @@ async def entrypoint(ctx: JobContext):
         logger.error("[SESSION] Timeout waiting for participant")
         return
 
-    crm_data = await _resolve_crm_data(ctx, participant)
+    # ── SIP / Twilio detection ────────────────────────────────────────────────
+    sip = extract_sip_attrs(participant)
 
-    logger.info(f"[SESSION] New call. CRM: {crm_data.get('customer_name') or crm_data.get('company_name') or 'Unknown'}")
+    if sip["is_sip"]:
+        logger.info(
+            "[SESSION] SIP call detected — callFrom=%s callTo=%s callID=%s",
+            sip["call_from"],
+            sip["call_to"],
+            sip["call_id"],
+        )
+        
+        # 1. First try lookup by caller ID (Inbound)
+        crm_data = await lookup_crm_by_phone(sip["call_from"])
+        
+        # 2. If missing, try lookup by dialled number (Outbound from Twilio)
+        if not crm_data and sip["call_to"]:
+            crm_data = await lookup_crm_by_phone(sip["call_to"])
+
+        # Backfill primary_phone from SIP headers if CRM had no phone
+        best_guess_phone = sip["call_to"] if (sip["call_to"] and not crm_data) else sip["call_from"]
+        if not crm_data.get("primary_phone") and best_guess_phone:
+            crm_data["primary_phone"] = best_guess_phone
+            logger.info("[SESSION] primary_phone set from SIP headers: %s", best_guess_phone)
+
+        # Backfill call_id from SIP
+        if sip["call_id"] and not crm_data.get("call_id"):
+            crm_data["call_id"] = sip["call_id"]
+    else:
+        # Web / playground call — use existing room/participant metadata path
+        crm_data = await _resolve_crm_data(ctx, participant)
+
+    logger.info(
+        "[SESSION] New call. source=%s CRM: %s",
+        "twilio-sip" if sip["is_sip"] else "web",
+        crm_data.get("customer_name") or crm_data.get("company_name") or "Unknown",
+    )
+
     turn_handling = build_turn_handling_options()
     runtime_options = build_session_runtime_options()
     conn_options = build_session_connect_options()
@@ -548,7 +590,7 @@ async def entrypoint(ctx: JobContext):
         agent=agent,
         room=ctx.room,
     )
-    
+
     # ── Greeting AFTER session.start ──
     async def _max_duration_watchdog():
         try:
@@ -565,7 +607,6 @@ async def entrypoint(ctx: JobContext):
     async def _cancel_watchdog(_reason: str = ""):
         if watchdog_task.done():
             return
-
         watchdog_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog_task
@@ -573,7 +614,7 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(_cancel_watchdog)
 
     await asyncio.sleep(1.0)
-    
+
     # Execute auto-chain: OPENING_GREETING (AUTO) → CONFIRM_IDENTITY (WAIT)
     auto_chain = execute_auto_chain(agent.session_data, State.OPENING_GREETING)
     combined_action = combine_chain_actions(auto_chain, agent.session_data)
@@ -599,7 +640,7 @@ def prewarm_process(proc):
 
 if __name__ == "__main__":
     from livekit.agents import cli
-    
+
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
@@ -609,4 +650,3 @@ if __name__ == "__main__":
             initialize_process_timeout=120.0
         )
     )
-

@@ -12,12 +12,21 @@ if str(BACKEND_ROOT) not in sys.path:
 import config
 from intent_classifier.classifier import IntentClassifier
 from state_machine.intents import Intent
+from state_machine.session import CallSession
+from state_machine.states import State
 from utils.stable_sarvam import NoReuseConnectionPool, StableSarvamTTS
 from utils.voice_session import (
     build_session_connect_options,
     build_session_runtime_options,
     build_turn_handling_options,
 )
+
+try:
+    from agent import prepare_direct_action
+    AGENT_IMPORT_ERROR = None
+except Exception as exc:
+    prepare_direct_action = None
+    AGENT_IMPORT_ERROR = exc
 
 
 class IntentClassifierFastPathTests(unittest.TestCase):
@@ -59,6 +68,36 @@ class IntentClassifierFastPathTests(unittest.TestCase):
         classifier = IntentClassifier()
 
         result = asyncio.run(classifier.classify("eight five two nine one five two one six eight"))
+
+        self.assertEqual(result, Intent.INFORM)
+        mocked_get_running_loop.assert_not_called()
+
+    @patch("intent_classifier.classifier._get_global_pool")
+    @patch("intent_classifier.classifier.asyncio.get_running_loop")
+    def test_double_and_triple_digit_payloads_use_fast_path(
+        self,
+        mocked_get_running_loop,
+        _mocked_get_global_pool,
+    ):
+        classifier = IntentClassifier()
+
+        result = asyncio.run(classifier.classify("nine eight three seven eight nine double two six two"))
+        self.assertEqual(result, Intent.INFORM)
+
+        result = asyncio.run(classifier.classify("one triple three double zero"))
+        self.assertEqual(result, Intent.INFORM)
+        mocked_get_running_loop.assert_not_called()
+
+    @patch("intent_classifier.classifier._get_global_pool")
+    @patch("intent_classifier.classifier.asyncio.get_running_loop")
+    def test_hindi_number_words_use_fast_path(
+        self,
+        mocked_get_running_loop,
+        _mocked_get_global_pool,
+    ):
+        classifier = IntentClassifier()
+
+        result = asyncio.run(classifier.classify("बाईस पचासी"))
 
         self.assertEqual(result, Intent.INFORM)
         mocked_get_running_loop.assert_not_called()
@@ -154,6 +193,25 @@ class StableSarvamRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["heartbeat"], config.SARVAM_WS_HEARTBEAT_SECONDS)
         self.assertTrue(captured["autoping"])
         self.assertTrue(captured["autoclose"])
+
+
+@unittest.skipIf(
+    prepare_direct_action is None,
+    f"agent import unavailable in this environment: {AGENT_IMPORT_ERROR}",
+)
+class AgentRenderRuntimeTests(unittest.TestCase):
+    def test_prepare_direct_action_keeps_callback_closing_renderable_after_auto_chain(self):
+        session = CallSession(
+            current_state=State.CALLBACK_CLOSING,
+            callback_closing_text="जी बिल्कुल, मैं आपको शाम पांच बजे call करती हूँ।",
+        )
+
+        combined_action, render_state = prepare_direct_action(session)
+
+        self.assertEqual(render_state, State.FIXED_CLOSING)
+        self.assertEqual(session.current_state, State.END)
+        self.assertIn("शाम पांच बजे", combined_action)
+        self.assertIn("Marg में बने रहने के लिए आपका धन्यवाद", combined_action)
 
 
 if __name__ == "__main__":

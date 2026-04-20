@@ -2,23 +2,27 @@
 from .states import State
 
 AUTO_TRANSITIONS: dict[State, State] = {
-    State.PRE_CLOSING: State.WARM_CLOSING,
-    State.REFERRAL_DECLINE_NUDGE: State.PRE_CLOSING,
-    State.CALLBACK_CLOSING: State.LOG_DISPOSITION,
-    State.INVALID_REGISTRATION: State.LOG_DISPOSITION,
-    State.WARM_CLOSING: State.LOG_DISPOSITION,
+    State.PRE_CLOSING: State.FIXED_CLOSING,
+    State.CALLBACK_CLOSING: State.FIXED_CLOSING,
+    State.INVALID_REGISTRATION: State.FIXED_CLOSING,
+    State.WARM_CLOSING: State.FIXED_CLOSING,
+    State.FIXED_CLOSING: State.LOG_DISPOSITION,
     State.LOG_DISPOSITION: State.END,
 }
 
 GLOBAL_OVERRIDES: list[tuple[Intent, State, set[State]]] = [
     (
         Intent.DEFER,
-        State.CALLBACK_CLOSING,
+        State.BUSY_NUDGE,
         {
             State.PRE_CLOSING,
             State.REFERRAL_DECLINE_NUDGE,
+            State.BUSY_NUDGE,
+            State.ASK_CALLBACK_TIME,
+            State.CONFIRM_CALLBACK_TIME,
             State.CALLBACK_CLOSING,
             State.WARM_CLOSING,
+            State.FIXED_CLOSING,
             State.LOG_DISPOSITION,
             State.END,
         },
@@ -29,8 +33,12 @@ GLOBAL_OVERRIDES: list[tuple[Intent, State, set[State]]] = [
         {
             State.PRE_CLOSING,
             State.REFERRAL_DECLINE_NUDGE,
+            State.BUSY_NUDGE,
+            State.ASK_CALLBACK_TIME,
+            State.CONFIRM_CALLBACK_TIME,
             State.CALLBACK_CLOSING,
             State.WARM_CLOSING,
+            State.FIXED_CLOSING,
             State.LOG_DISPOSITION,
             State.END,
         },
