@@ -43,7 +43,6 @@ from content_extraction.extractor_logic import build_render_context
 from dispositions.resolver import compute_disposition
 from dispositions.logger import log_call
 from utils.logger import pipeline_logger, log_metric
-from telephony.sip import extract_sip_attrs, lookup_crm_by_phone
 from utils.stable_sarvam import StableSarvamTTS
 from utils.transcript import sanitize_user_transcript
 from utils.voice_session import (
@@ -477,6 +476,7 @@ class आकृतिAgent(Agent):
             logger.error(f"Disconnect error: {e}")
 
 
+
 # ══════════════════════════════════════════════════════════════════════
 # LIVEKIT WORKER SETUP
 # ══════════════════════════════════════════════════════════════════════
@@ -484,7 +484,7 @@ class आकृतिAgent(Agent):
 async def entrypoint(ctx: JobContext):
     """LiveKit room session entrypoint."""
     await ctx.connect()
-
+    
     try:
         participant = await asyncio.wait_for(
             ctx.wait_for_participant(), timeout=30
@@ -493,43 +493,9 @@ async def entrypoint(ctx: JobContext):
         logger.error("[SESSION] Timeout waiting for participant")
         return
 
-    # ── SIP / Twilio detection ────────────────────────────────────────────────
-    sip = extract_sip_attrs(participant)
+    crm_data = await _resolve_crm_data(ctx, participant)
 
-    if sip["is_sip"]:
-        logger.info(
-            "[SESSION] SIP call detected — callFrom=%s callTo=%s callID=%s",
-            sip["call_from"],
-            sip["call_to"],
-            sip["call_id"],
-        )
-        
-        # 1. First try lookup by caller ID (Inbound)
-        crm_data = await lookup_crm_by_phone(sip["call_from"])
-        
-        # 2. If missing, try lookup by dialled number (Outbound from Twilio)
-        if not crm_data and sip["call_to"]:
-            crm_data = await lookup_crm_by_phone(sip["call_to"])
-
-        # Backfill primary_phone from SIP headers if CRM had no phone
-        best_guess_phone = sip["call_to"] if (sip["call_to"] and not crm_data) else sip["call_from"]
-        if not crm_data.get("primary_phone") and best_guess_phone:
-            crm_data["primary_phone"] = best_guess_phone
-            logger.info("[SESSION] primary_phone set from SIP headers: %s", best_guess_phone)
-
-        # Backfill call_id from SIP
-        if sip["call_id"] and not crm_data.get("call_id"):
-            crm_data["call_id"] = sip["call_id"]
-    else:
-        # Web / playground call — use existing room/participant metadata path
-        crm_data = await _resolve_crm_data(ctx, participant)
-
-    logger.info(
-        "[SESSION] New call. source=%s CRM: %s",
-        "twilio-sip" if sip["is_sip"] else "web",
-        crm_data.get("customer_name") or crm_data.get("company_name") or "Unknown",
-    )
-
+    logger.info(f"[SESSION] New call. CRM: {crm_data.get('customer_name') or crm_data.get('company_name') or 'Unknown'}")
     turn_handling = build_turn_handling_options()
     runtime_options = build_session_runtime_options()
     conn_options = build_session_connect_options()
@@ -590,7 +556,7 @@ async def entrypoint(ctx: JobContext):
         agent=agent,
         room=ctx.room,
     )
-
+    
     # ── Greeting AFTER session.start ──
     async def _max_duration_watchdog():
         try:
@@ -607,6 +573,7 @@ async def entrypoint(ctx: JobContext):
     async def _cancel_watchdog(_reason: str = ""):
         if watchdog_task.done():
             return
+
         watchdog_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog_task
@@ -614,7 +581,7 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(_cancel_watchdog)
 
     await asyncio.sleep(1.0)
-
+    
     # Execute auto-chain: OPENING_GREETING (AUTO) → CONFIRM_IDENTITY (WAIT)
     auto_chain = execute_auto_chain(agent.session_data, State.OPENING_GREETING)
     combined_action = combine_chain_actions(auto_chain, agent.session_data)
@@ -640,7 +607,7 @@ def prewarm_process(proc):
 
 if __name__ == "__main__":
     from livekit.agents import cli
-
+    
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
@@ -650,3 +617,4 @@ if __name__ == "__main__":
             initialize_process_timeout=120.0
         )
     )
+
