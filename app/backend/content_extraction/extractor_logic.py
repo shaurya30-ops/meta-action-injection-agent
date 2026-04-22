@@ -1,4 +1,5 @@
-﻿import re
+import datetime
+import re
 from state_machine.session import CallSession
 from state_machine.states import State
 
@@ -542,6 +543,16 @@ def email_fragment_restart_requested(text: str) -> bool:
 
 
 def extract_email_candidate(session: CallSession, transcript: str) -> str:
+    direct_email = normalize_email(transcript)
+    if direct_email:
+        direct_local_part = direct_email.split("@", 1)[0]
+        direct_looks_complete = (
+            len(direct_local_part) >= 6
+            or any(char in direct_local_part for char in "._-")
+        )
+        if not session.email_fragment_buffer or direct_looks_complete:
+            return direct_email
+
     if session.current_state.name in {"VERIFY_EMAIL", "COLLECT_EMAIL_CORRECTION", "CONFIRM_EMAIL_CORRECTION"} and session.email_fragment_buffer:
         combined = merge_spoken_email_fragments(
             session.email_fragment_buffer,
@@ -552,7 +563,6 @@ def extract_email_candidate(session: CallSession, transcript: str) -> str:
         if combined_email:
             return combined_email
 
-    direct_email = normalize_email(transcript)
     if direct_email:
         return direct_email
 
@@ -582,10 +592,8 @@ def has_specific_callback_phrase(text: str) -> bool:
 
 
 def build_callback_closing(text: str) -> str:
-    phrase = extract_callback_phrase(text)
-    if phrase:
-        return f"जी बिल्कुल, मैं आपको {phrase} call करती हूँ।"
-    return "जी बिल्कुल, मैं थोड़ी देर बाद call करती हूँ।"
+    phrase = normalize_callback_phrase(text)
+    return f"जी बिल्कुल, मैं आपको {phrase} call करती हूँ।"
 
 
 def build_terminal_closing_text(session: CallSession) -> str:
@@ -644,17 +652,25 @@ def extract_business_details(text: str, fallback_type: str = "", fallback_trade:
 
 def extract_name_fragment(text: str) -> str:
     cleaned = text
+    cleaned = re.sub(r"\b(?:मेरा|मेरी|मेरे)\s+नाम\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:my)\s+name\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:मेरा|मेरी|मेरे)\b", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine)\b", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"[0-9०-९]", " ", cleaned)
     cleaned = re.sub(
         r"\b(?:जी|haan|हाँ|yes|number|contact|mobile|phone|hai|है|उसका|unka|उनका|referral|referal|वाले|वाला|"
         r"बताया|लिखो|लिखिए|note|करो|करिए|share|madam|ma'am|mam|मैम|तो|पूरा|दस|ten|"
-        r"नाम|का|की|बताइए|बताओ|लिया|लिए)\b",
+        r"नाम|का|की|मेरा|मेरी|मेरे|बताइए|बताओ|लिया|लिए)\b",
         " ",
         cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(r"(?:है|हूं|हूँ|hu|hoon)\.?\s*$", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    if cleaned.lower() in {"haan", "han", "yes", "ji", "haan ji", "yes ji"}:
+        return ""
+    if cleaned in {"हाँ", "हां", "जी", "हाँ जी", "हां जी"}:
+        return ""
     return cleaned
 
 
@@ -797,7 +813,13 @@ def extract_and_store(session: CallSession, state, transcript: str):
             session.technical_issue_detail = cleaned
         return
 
-    if state.name == "COLLECT_TRAINING_PINCODE":
+    if state.name == "ASK_TRAINING_PENDING_DURATION":
+        cleaned = transcript.strip()
+        if cleaned:
+            session.training_pending_duration = cleaned
+        return
+
+    if state.name in {"COLLECT_TRAINING_PINCODE", "CONFIRM_TRAINING_PINCODE"}:
         digits = extract_digits(transcript)
         if digits:
             session.training_area_pincode = digits[:6]
@@ -843,6 +865,11 @@ def extract_and_store(session: CallSession, state, transcript: str):
             session.referral_name = name
         return
 
+    if state.name in {"COLLECT_REFERRAL_PINCODE", "CONFIRM_REFERRAL_DETAILS"}:
+        digits = extract_digits(transcript)
+        if digits:
+            session.referral_pincode = digits[:6]
+        return
 
 def _clarification_target_state(session: CallSession) -> State | None:
     return session.resume_state or session.current_state
@@ -854,7 +881,7 @@ def _build_clarification_response_prompt(session: CallSession) -> str:
     query_text = (session.last_user_query_text or "").lower()
 
     company_name = session.company_name or session.firm_name or session.customer_name or "आपकी company"
-    crm_pincode = session.pincode or session.crm_pincode
+    recorded_pincode = session.pincode or session.crm_pincode or session.training_area_pincode
     crm_email = session.crm_email
     current_email = session.email or session.crm_email
     business_type = normalize_business_type_for_speech(
@@ -863,7 +890,12 @@ def _build_clarification_response_prompt(session: CallSession) -> str:
     business_trade = session.business_trade or session.crm_business_trade or "records में available detail"
     whatsapp_digits = session.whatsapp_number or session.whatsapp_digit_buffer or session.primary_phone
     alternate_digits = session.alternate_number or session.alternate_digit_buffer
-    pincode_digits = session.pincode or session.pincode_digit_buffer or session.crm_pincode
+    pincode_digits = (
+        session.pincode
+        or session.pincode_digit_buffer
+        or session.training_area_pincode
+        or session.crm_pincode
+    )
     referral_digits = session.referral_number or session.referral_digit_buffer
     referral_name = session.referral_name or "उस person"
 
@@ -946,17 +978,22 @@ def _build_clarification_response_prompt(session: CallSession) -> str:
         return f"जी, मैं वही alternate number confirm कर रही हूँ — {digits_to_tts(alternate_digits)} — क्या यही सही है?"
 
     if state == State.VERIFY_PINCODE:
-        if kind == "recorded_value" and crm_pincode:
+        if kind == "recorded_value" and recorded_pincode:
             return (
-                f"जी, मेरे record में pin code — {digits_to_tts(crm_pincode)} — है. "
+                f"जी, मेरे record में pin code — {digits_to_tts(recorded_pincode)} — है. "
                 "क्या यही सही है?"
+            )
+        if not recorded_pincode:
+            return (
+                "जी, मैं area details update रखने के लिए pin code confirm कर रही हूँ. "
+                "अगर convenient हो तो अपना area pin code बता दीजिए?"
             )
         if kind == "reason":
             return (
                 "जी, मैं area details update रखने के लिए pin code confirm कर रही हूँ. "
-                f"आपका area pin code — {digits_to_tts(crm_pincode)} — यही है?"
+                f"आपका area pin code — {digits_to_tts(recorded_pincode)} — यही है?"
             )
-        return f"जी, मैं आपके record का pin code confirm कर रही हूँ — {digits_to_tts(crm_pincode)} — क्या यही सही है?"
+        return f"जी, मैं आपके record का pin code confirm कर रही हूँ — {digits_to_tts(recorded_pincode)} — क्या यही सही है?"
 
     if state == State.COLLECT_PINCODE:
         if kind == "recorded_value" and pincode_digits:
@@ -1074,98 +1111,240 @@ def _build_clarification_response_prompt(session: CallSession) -> str:
     )
 
 
+def _build_business_capability_prompt(session: CallSession) -> str:
+    trade = (session.business_trade or session.crm_business_trade or "").lower()
+    business_type = (session.business_type or session.crm_business_type or "").lower()
+
+    if any(keyword in trade for keyword in ("pharma", "medical", "medicine")) or any(
+        keyword in business_type for keyword in ("pharma", "medical", "medicine")
+    ):
+        return "GST-ready billing, batch-expiry tracking, और stock control जैसी features"
+    if any(keyword in trade for keyword in ("fmcg", "grocery", "kirana", "general")):
+        return "fast billing, live stock tracking, और order management जैसी features"
+    if any(keyword in trade for keyword in ("distributor", "wholesale", "wholesaler")) or "distributor" in business_type:
+        return "order tracking, collection follow-up, और multi-location control जैसी features"
+    return "billing, inventory, और daily operations manage करने वाली features"
+
+_VAGUE_CALLBACK_SLOTS = {
+    "सुबह": (10, 0),
+    "morning": (10, 0),
+    "दोपहर": (12, 0),
+    "afternoon": (12, 0),
+    "शाम": (17, 0),
+    "evening": (17, 0),
+    "रात": (19, 0),
+    "night": (19, 0),
+}
+
+def _format_callback_target(dt: datetime.datetime, *, include_day: bool) -> str:
+    hour = dt.hour
+    minute = dt.minute
+    if hour == 0:
+        display_hour, suffix = 12, "रात"
+    elif hour < 12:
+        display_hour, suffix = hour, "सुबह"
+    elif hour == 12:
+        display_hour, suffix = 12, "दोपहर"
+    elif hour < 17:
+        display_hour, suffix = hour - 12, "दोपहर"
+    elif hour < 19:
+        display_hour, suffix = hour - 12, "शाम"
+    else:
+        display_hour, suffix = (hour - 12 if hour > 12 else hour), "रात"
+    minute_part = f" {minute} मिनट" if minute else ""
+    day_prefix = ""
+    if include_day:
+        today = datetime.datetime.now().date()
+        if dt.date() == today:
+            day_prefix = "आज "
+        elif dt.date() == today + datetime.timedelta(days=1):
+            day_prefix = "कल "
+        else:
+            day_prefix = dt.strftime("%d %B ")
+    return f"{day_prefix}{suffix} {display_hour} बजे{minute_part}".strip()
+
+def normalize_callback_phrase(text: str) -> str:
+    phrase = extract_callback_phrase(text)
+    now = datetime.datetime.now().replace(second=0, microsecond=0)
+    lowered = (phrase or text).lower()
+    if not phrase:
+        return "कल सुबह 10 बजे"
+    if re.search(r"आधे\s+घंटे\s+बाद", phrase, re.IGNORECASE):
+        return _format_callback_target(now + datetime.timedelta(minutes=30), include_day=True)
+    minute_match = re.search(r"([A-Za-z0-9०-९ऀ-ॿ]+)\s+(?:minute|minutes|mins?|मिनट)\s+बाद", phrase, re.IGNORECASE)
+    if minute_match:
+        minutes = int(extract_digits(minute_match.group(1)) or "0")
+        target = now + datetime.timedelta(minutes=max(minutes, 1))
+        if target.hour < 10:
+            target = target.replace(hour=10, minute=0)
+        elif target.hour >= 19:
+            overflow_minutes = max(target.hour * 60 + target.minute - 19 * 60, 0)
+            target = (target + datetime.timedelta(days=1)).replace(hour=10, minute=0) + datetime.timedelta(minutes=overflow_minutes)
+        return _format_callback_target(target, include_day=True)
+    hour_match = re.search(r"([A-Za-z0-9०-९ऀ-ॿ]+)\s+(?:hour|hours|घंटे?|घंटा)\s+बाद", phrase, re.IGNORECASE)
+    if hour_match:
+        hours = int(extract_digits(hour_match.group(1)) or "0")
+        target = now + datetime.timedelta(hours=max(hours, 1))
+        if target.hour < 10:
+            target = target.replace(hour=10, minute=0)
+        elif target.hour >= 19:
+            target = (target + datetime.timedelta(days=1)).replace(hour=10, minute=target.minute)
+        return _format_callback_target(target, include_day=True)
+    ampm_match = re.search(r"(\d{1,2})\s*(am|pm)", lowered, re.IGNORECASE)
+    if ampm_match:
+        hour = int(ampm_match.group(1)) % 12
+        if ampm_match.group(2).lower() == "pm":
+            hour += 12
+        minute = 0
+    else:
+        digits = extract_digits(phrase)
+        hour = int(digits[:2] if len(digits) >= 2 else digits[:1] or "10")
+        minute = 0
+        for slot, (slot_h, slot_m) in _VAGUE_CALLBACK_SLOTS.items():
+            if slot in lowered:
+                minute = slot_m
+                if hour <= 12 and slot_h in {17, 19}:
+                    hour = (hour % 12) + 12 if digits else slot_h
+                elif not digits:
+                    hour = slot_h
+                break
+    target = now + datetime.timedelta(days=1 if ("कल" in lowered or "tomorrow" in lowered) else 0)
+    target = target.replace(hour=hour, minute=minute)
+    if target.hour < 10:
+        target = target.replace(hour=10, minute=0)
+    elif target.hour >= 19:
+        target = (target + datetime.timedelta(days=1)).replace(hour=10, minute=minute if minute else 0)
+    if target <= now and "कल" not in lowered and "tomorrow" not in lowered and "बाद" not in lowered:
+        target = target + datetime.timedelta(days=1)
+        if target.hour < 10:
+            target = target.replace(hour=10, minute=0)
+    return _format_callback_target(target, include_day=True)
+
+def build_support_and_referral_prompt(session: CallSession) -> str:
+    if session.billing_started == "STARTED":
+        support_line = (
+            "आपकी जानकारी के लिए — अगर Marg ERP software में कोई भी problem आए, तो software के home page के top पर 'Marg Help' का option है, वहाँ images और videos के through help ले सकते हैं. "
+            "और उसी के साथ 'Ticket' का option भी available है — license number mention करके ticket raise कर सकते हैं, तो हमारी side से call आ जाएगी."
+        )
+    else:
+        support_line = (
+            "आपकी जानकारी के लिए — अगर installation, setup, या training में कोई भी problem आए, तो हमारी side से nearest partner और support team follow-up करेगी. "
+            "ऐसे case में आपको अभी ticket raise करने की ज़रूरत नहीं है."
+        )
+    return (
+        f"{support_line} साथ ही Marg की तरफ से free software demo भी arrange किया जा रहा है — अगर आपके known में कोई person billing software लेने में interested हो, तो क्या आप उनका नाम और contact number share कर सकते हैं?"
+    )
+
+def build_wrong_number_pitch_prompt(_session: CallSession) -> str:
+    return (
+        "जानकारी के लिए बता दूँ — Marg ERP एक billing और inventory management software है जो business को daily operations जैसे billing, stock, और orders manage करने में help करता है — अगर कभी ज़रूरत हो तो याद रखें।"
+    )
+
+def build_wrong_number_help_check_prompt(_session: CallSession) -> str:
+    return "क्या आपको किसी और चीज़ में help चाहिए?"
+
+def build_wrong_number_closing_prompt(_session: CallSession) -> str:
+    return "आपका समय देने के लिए बहुत शुक्रिया. आपका दिन शुभ रहे।"
+
+def build_resume_prompt(session: CallSession, resume_state: State | None) -> str:
+    if resume_state == State.ASK_BILLING_STATUS:
+        return "क्या आपके software में billing start हो गई है?"
+    if resume_state == State.EXPLORE_BILLING_BLOCKER:
+        return build_billing_blocker_prompt(session)
+    if resume_state == State.ASK_BILLING_START_TIMELINE:
+        return build_billing_start_timeline_prompt(session)
+    if resume_state == State.VERIFY_WHATSAPP:
+        return "जिस register number से बात हो रही है — वो WhatsApp पर available है?"
+    if resume_state == State.ASK_ALTERNATE_NUMBER:
+        return "क्या आप कोई alternate number भी देना चाहेंगे?"
+    if resume_state == State.VERIFY_PINCODE:
+        recorded = session.crm_pincode or session.training_area_pincode or session.pincode
+        return f"हमारे records में आपका pin code है — {digits_to_tts(recorded)} — क्या यही सही है?" if recorded else "अगर convenient हो तो अपना area pin code बता दीजिए?"
+    if resume_state == State.VERIFY_BUSINESS_DETAILS:
+        return f"आपका business {session.business_trade or session.crm_business_trade or 'records में available detail'} में है — और आप {normalize_business_type_for_speech(session.business_type or session.crm_business_type or 'records में available detail')} हैं?"
+    if resume_state == State.VERIFY_EMAIL:
+        current_email = session.email or session.crm_email
+        return f"आपकी email ID — {email_to_tts(current_email)} — यही है?" if current_email else "क्या आप अपनी email ID बता सकते हैं?"
+    if resume_state == State.ASK_PURCHASE_AMOUNT:
+        return build_purchase_amount_prompt(session)
+    if resume_state == State.SUPPORT_AND_REFERRAL:
+        return build_support_and_referral_prompt(session)
+    if resume_state == State.COLLECT_REFERRAL_NAME:
+        return "उनका नाम क्या है?"
+    if resume_state == State.COLLECT_REFERRAL_NUMBER:
+        return f"और {session.referral_name or 'उनका'} contact number?"
+    if resume_state == State.COLLECT_REFERRAL_PINCODE:
+        return "और उनका area pin code?"
+    return ""
+
+def build_mobile_update_confirmation_prompt(session: CallSession) -> str:
+    resume_prompt = build_resume_prompt(session, session.number_change_resume_state)
+    if resume_prompt:
+        return f"ठीक है — आपका यह number change कर दिया जाएगा। {resume_prompt}"
+    return "ठीक है — आपका यह number change कर दिया जाएगा।"
+
+
 def build_query_response_prompt(session: CallSession) -> str:
     query_type = session.last_user_query_type
     target_state = session.resume_state or session.current_state
+    query_text = (session.last_user_query_text or "").lower()
+    capability_prompt = _build_business_capability_prompt(session)
+
+    if target_state == State.COLLECT_WRONG_CONTACT_NUMBER:
+        return "बस इसलिए कि हम अपना database update कर सकें — ताकि आपको बार-बार ऐसी call न आए। क्या इससे बात clear हुई?"
 
     if query_type in {"technical_support", "dealer_setup"}:
-        if query_type == "dealer_setup":
-            return (
-                "जी, समझ सकती हूँ — setup phase में थोड़ा time लगता है. "
-                "Software के home page पर 'Marg Help' में step-by-step images और videos मिल जाएँगे. "
-                "और अगर setup complete कराने में help चाहिए, तो 'Ticket' option से हमारी team की side से call आ जाएगी. "
-                "क्या इससे थोड़ी clarity मिली?"
-            )
-        return (
-            "जी, अच्छा किया आपने बताया. इसके लिए software के home page पर 'Ticket' का option है — "
-            "license number डालकर ticket raise करें, हमारी team की side से call आ जाएगी. "
-            "क्या इससे आपका सवाल clear हो गया?"
-        )
+        if "training" in query_text or "ट्रेनिंग" in query_text:
+            return "जी, training के लिए मैं आपके nearest partner से follow-up करवाऊँगी. 24 से 48 घंटों के अंदर update मिल जाना चाहिए. क्या इससे बात clear हुई?"
+        if session.billing_started == "STARTED" or (session.billing_blocker_reason not in {"dealer_setup", "training_pending", "setup_in_progress"}):
+            return "जी, अच्छा किया आपने बताया. Software के home page पर 'Marg Help' और 'Ticket' option available हैं. license number mention करके ticket raise करेंगे, तो हमारी team की side से call आ जाएगी. क्या इससे आपका सवाल clear हो गया?"
+        return "जी, अगर setup या installation pending है, तो मैं इसे partner follow-up के तौर पर note कर रही हूँ. ऐसे case में direct coordination होता है — ticket raise करने की ज़रूरत नहीं है. क्या इससे बात clear हुई?"
 
     if query_type == "pricing":
-        return (
-            "जी, इसकी exact pricing आपके plan पर depend करती है. इसके लिए आप ticket raise करें "
-            "या Marg Help section देखें — हमारी team आपको सही detail बता देगी. "
-            "क्या इससे आपका सवाल clear हो गया?"
-        )
+        return "जी, pricing location और कुछ factors पर depend करती है — concerned team आपसे जल्द बात करेगी. क्या इससे आपका सवाल clear हो गया?"
 
     if query_type == "clarification":
         return _build_clarification_response_prompt(session)
 
+    if query_type == "general" and "training" in query_text:
+        return "जी, training execution हमारे nearest partner की side से होती है. अगर training pending है, तो मैं partner follow-up note करवा सकती हूँ. क्या इससे बात clear हुई?"
+
     if query_type == "general" and target_state == State.ASK_PURCHASE_AMOUNT:
-        return (
-            "जी, मेरे record में exact purchase amount अभी clearly visible नहीं है, इसलिए मैं आपसे confirm कर रही हूँ. "
-            "अगर exact amount याद न हो तो भी कोई बात नहीं — आप अंदाज़ा amount बता सकते हैं. "
-            "क्या इससे बात clear हुई?"
-        )
+        return "जी, मेरे record में exact purchase amount अभी clearly visible नहीं है, इसलिए मैं आपसे confirm कर रही हूँ. अगर exact amount याद न हो तो भी कोई बात नहीं — आप अंदाज़ा amount बता सकते हैं. क्या इससे बात clear हुई?"
 
-    return (
-        "जी, मैं short में बता देती हूँ. अगर detail support चाहिए, तो Marg Help section या Ticket option "
-        "से हमारी team तक बात पहुँच जाएगी. क्या इससे आपका सवाल clear हो गया?"
-    )
+    if query_type == "general":
+        return f"जी, Marg ERP में {capability_prompt} मिलती हैं. अगर आपको किसी specific feature पर detail चाहिए, तो मैं short में guide कर सकती हूँ. क्या इससे बात clear हुई?"
 
+    return "जी, मैं short में बता देती हूँ. अगर detail support चाहिए, तो सही team तक बात पहुँचा दी जाएगी. क्या इससे आपका सवाल clear हो गया?"
 
 def build_callback_time_prompt(session: CallSession) -> str:
     if session.callback_prompt_override.strip():
         return session.callback_prompt_override.strip()
-
     if session.callback_time_attempts > 0:
-        return (
-            "जी, ताकि मैं सही time पर call करूँ, कृपया सिर्फ time या दिन बता दीजिए — "
-            "जैसे आज शाम, कल सुबह, या 10 minute बाद."
-        )
-
-    return "तो मैं कब call करूँ — आप बताइए कौन सा time सही रहेगा?"
-
+        return "जी, ताकि मैं सही time पर call करूँ, कृपया सिर्फ time या दिन बता दीजिए — जैसे आज शाम, कल सुबह, या 10 minute बाद."
+    return "जी बिल्कुल। तो मैं कब call करूँ?"
 
 def build_callback_confirmation_prompt(session: CallSession) -> str:
-    phrase = session.callback_time_phrase or "थोड़ी देर बाद"
-    return f"जी, तो मैं {phrase} call करूँगी — सही है?"
-
+    phrase = normalize_callback_phrase(session.callback_time_phrase or "")
+    return f"जी, {phrase} पर call करूँगी — सही है?"
 
 def build_billing_blocker_support_prefix(session: CallSession) -> str:
     reason = session.billing_blocker_reason or session.last_blocker_reason
     if reason == "partner_non_responsive":
-        return (
-            "जी, मैंने detail note कर ली है. हम partner से contact करेंगे. "
-            "20 से 48 घंटों के अंदर update मिल जाना चाहिए."
-        )
-    if reason == "setup_in_progress":
-        return (
-            "जी, बिल्कुल समझ सकती हूँ — setup पूरा होने में थोड़ा time लग सकता है. "
-            "जब setup complete हो जाए, Marg Help section में step-by-step guidance मिल जाएगी."
-        )
+        return "जी, मैंने detail note कर ली है. हम partner से contact करेंगे. 20 से 48 घंटों के अंदर update मिल जाना चाहिए."
+    if reason in {"setup_in_progress", "employee_on_leave"}:
+        return "जी, समझ गई. जैसे ही setup side ready होगी, हम next step smoothly continue कर सकते हैं।"
     if reason == "technical_issue":
-        return (
-            "जी, issue note कर लिया है. Marg Help और Ticket option भी available हैं. "
-            "हमारी team 24 घंटों के अंदर contact करेगी."
-        )
+        return "जी, issue note कर लिया है. हमारी team 24 घंटों के अंदर contact करेगी।"
     if reason in {"dealer_setup", "training_pending"}:
-        return (
-            "जी, training request note कर ली है. 24 से 48 घंटों के अंदर हमारी team contact करेगी."
-        )
+        return "जी, training request note कर ली है. 24 से 48 घंटों के अंदर हमारी team contact करेगी।"
     if reason == "migration_delay":
-        return (
-            "जी, ठीक है — migration complete होते ही billing start की जा सकती है."
-        )
+        return "जी, ठीक है — migration complete होते ही billing start की जा सकती है।"
     if reason == "no_time":
-        return (
-            "जी, बिल्कुल समझ सकती हूँ — जैसे ही time मिलेगा, आप billing start कर सकते हैं."
-        )
-    if reason in {"switched_software", "business_closed", "abusive_language", "generic_escalation"}:
-        return "हमारी team आपसे जल्द contact करेगी."
-    return "जी, noted."
-
+        return "जी, बिल्कुल समझ सकती हूँ — जैसे ही time मिलेगा, आप billing start कर सकते हैं।"
+    if reason in {"switched_software", "business_closed", "abusive_language", "generic_escalation", "will_not_use"}:
+        return "हमारी team आपसे जल्द contact करेगी।"
+    return "जी, noted।"
 
 def build_complaint_detail_prompt(_session: CallSession) -> str:
     return "जी, अच्छा किया आपने बताया. कृपया short में बताइए issue क्या है?"
@@ -1198,8 +1377,7 @@ def build_technical_issue_prompt(_session: CallSession) -> str:
 
 
 def build_training_pincode_prompt(_session: CallSession) -> str:
-    return "जी, training arrange कराने के लिए area pin code बता दीजिए?"
-
+    return "और आपका area pin code क्या है जहाँ training चाहिए?"
 
 def build_billing_blocker_prompt(session: CallSession) -> str:
     if session.billing_blocker_refusal_count == 1:
@@ -1219,14 +1397,12 @@ def build_billing_start_timeline_prompt(session: CallSession) -> str:
 
 
 def build_detour_anything_else_prompt(session: CallSession) -> str:
-    return "क्या कोई और बात है?"
-
+    return "क्या मैं आपकी किसी और तरह से help कर सकती हूँ?"
 
 def build_purchase_amount_prompt(session: CallSession) -> str:
     if session.purchase_amount_refusal_count == 1:
-        return "जी, ये amount database clean रहता है, इसलिए एक बार confirm कर रही हूँ। अगर याद हो तो बता दीजिए?"
-    return "आप बता सकते हैं — आपने जो software purchase किया था, वो किस amount पर था?"
-
+        return "records accurate रखने के लिए ज़रूरी है — बता सकते हैं?"
+    return "आपने software किस amount पर purchase किया था?"
 
 def build_email_collection_prompt(session: CallSession) -> str:
     if session.email_fragment_buffer and session.current_state.name == "COLLECT_EMAIL_CORRECTION":
@@ -1256,20 +1432,16 @@ def build_busy_nudge_prompt(_session: CallSession) -> str:
 
 
 def build_wrong_contact_company_prompt(_session: CallSession) -> str:
-    return "जी, क्षमा करें — क्या मैं पूछ सकती हूँ आप कहाँ से बोल रहे हैं?"
-
+    return "जी, क्या मैं पूछ सकती हूँ आप कहाँ से बोल रहे हैं?"
 
 def build_wrong_contact_trade_prompt(_session: CallSession) -> str:
     return "जी, धन्यवाद. उनका business trade क्या है?"
 
-
 def build_wrong_contact_type_prompt(_session: CallSession) -> str:
     return "और business type manufacturer, distributor या retailer में से क्या है?"
 
-
 def build_wrong_contact_name_prompt(_session: CallSession) -> str:
-    return "जी, और आपका नाम क्या है? — ताकि हम अपने records update कर सकें और आपको बार-बार call न आए।"
-
+    return "जी, कोई बात नहीं — माफ़ी चाहती हूँ आपका समय लेने के लिए. बस एक second — क्या आप अपना नाम बता सकते हैं?"
 
 def build_concerned_person_label(session: CallSession) -> str:
     if session.concerned_person_name:
@@ -1279,21 +1451,24 @@ def build_concerned_person_label(session: CallSession) -> str:
 
 def build_render_context(session: CallSession) -> dict:
     company_name = session.company_name or session.firm_name or session.customer_name or "आपकी company"
-    crm_pincode = session.pincode or session.crm_pincode
+    recorded_pincode = session.crm_pincode or session.pincode or session.training_area_pincode
     crm_email = session.crm_email
     current_email = session.email or session.crm_email
-    business_type = normalize_business_type_for_speech(
-        session.business_type or session.crm_business_type or "records में उपलब्ध नहीं"
-    )
+    business_type = normalize_business_type_for_speech(session.business_type or session.crm_business_type or "records में उपलब्ध नहीं")
     business_trade = session.business_trade or session.crm_business_trade or "records में उपलब्ध नहीं"
-
     whatsapp_digits = session.whatsapp_number or session.whatsapp_digit_buffer
     alternate_digits = session.alternate_number or session.alternate_digit_buffer
     concerned_person_digits = session.concerned_person_number or session.concerned_person_digit_buffer
     pincode_digits = session.pincode or session.pincode_digit_buffer
     referral_digits = session.referral_number or session.referral_digit_buffer
+    referral_pincode_digits = session.referral_pincode or session.referral_pincode_digit_buffer
+    wrong_contact_digits = session.wrong_contact_number or session.wrong_contact_digit_buffer
+    mobile_update_digits = session.mobile_update_number or session.mobile_update_digit_buffer
+    redirect_digits = session.redirect_number or session.redirect_digit_buffer
+    training_pincode_digits = session.training_area_pincode
     followup_prompt = session.collection_followup_prompt
     concerned_person_label = build_concerned_person_label(session)
+    display_referral_name = f"{session.referral_name} जी" if session.referral_name else "उस person"
 
     if session.current_state.name == "CONFIRM_WHATSAPP_NUMBER" and whatsapp_digits:
         whatsapp_prompt = f"तो आपका WhatsApp number है — {digits_to_tts(whatsapp_digits)} — सही है?"
@@ -1302,7 +1477,7 @@ def build_render_context(session: CallSession) -> dict:
     elif session.whatsapp_digit_buffer:
         whatsapp_prompt = "जी, आगे बताइए।"
     else:
-        whatsapp_prompt = "ठीक है जी — कृपया अपना WhatsApp number बताइए?"
+        whatsapp_prompt = "कृपया WhatsApp number बताइए?"
 
     if session.current_state.name == "CONFIRM_ALTERNATE_NUMBER" and alternate_digits:
         alternate_prompt = f"तो आपका alternate number है — {digits_to_tts(alternate_digits)} — सही है?"
@@ -1311,23 +1486,18 @@ def build_render_context(session: CallSession) -> dict:
     elif session.alternate_digit_buffer:
         alternate_prompt = "जी, आगे बताइए।"
     else:
-        alternate_prompt = "ठीक है जी — कृपया alternate number बताइए?"
+        alternate_prompt = "कृपया alternate number बताइए?"
 
     if session.current_state.name == "CONFIRM_CONCERNED_PERSON_NUMBER" and concerned_person_digits:
-        concerned_person_prompt = (
-            f"तो {concerned_person_label} का contact number है — {digits_to_tts(concerned_person_digits)} — सही है?"
-        )
+        concerned_person_prompt = f"तो {concerned_person_label} का contact number है — {digits_to_tts(concerned_person_digits)} — सही है?"
     elif followup_prompt and session.current_state.name == "COLLECT_CONCERNED_PERSON_NUMBER":
         concerned_person_prompt = followup_prompt
     elif session.concerned_person_digit_buffer:
         concerned_person_prompt = "जी, आगे बताइए।"
     else:
-        concerned_person_prompt = f"जी, ठीक है. {concerned_person_label} का contact number बताइए?"
+        concerned_person_prompt = "उनका contact number दे सकते हैं?"
 
-    concerned_person_handoff_prompt = (
-        f"जी, समझ सकती हूँ — आप शायद software directly use नहीं कर रहे हैं। "
-        f"क्या आप मुझे {concerned_person_label} का contact number दे सकते हैं?"
-    )
+    concerned_person_handoff_prompt = f"जी, कोई बात नहीं — समझ गई आप busy हैं. {concerned_person_label} का contact number दे सकते हैं?"
 
     if session.current_state.name == "CONFIRM_PINCODE" and pincode_digits:
         pincode_prompt = f"तो आपका pin code है — {digits_to_tts(pincode_digits)} — सही है?"
@@ -1345,33 +1515,30 @@ def build_render_context(session: CallSession) -> dict:
     elif session.referral_digit_buffer:
         referral_prompt = "जी, आगे बताइए।"
     elif session.referral_name:
-        referral_prompt = f"जी, {session.referral_name} जी का contact number बताइए।"
+        referral_prompt = f"और {session.referral_name} जी का contact number?"
     else:
-        referral_prompt = "जी, उनका contact number बताइए।"
+        referral_prompt = "और उनका contact number?"
+
+    if followup_prompt and session.current_state.name == "COLLECT_REFERRAL_PINCODE":
+        referral_pincode_prompt = followup_prompt
+    elif session.referral_pincode_digit_buffer:
+        referral_pincode_prompt = "जी, आगे बताइए।"
+    else:
+        referral_pincode_prompt = "और उनका area pin code?"
 
     email_prompt = build_email_collection_prompt(session)
+    verify_pincode_prompt = f"हमारे records में आपका pin code है — {digits_to_tts(recorded_pincode)} — क्या यही सही है?" if recorded_pincode else "मेरे record में pin code available नहीं दिख रहा. अगर convenient हो तो अपना area pin code बता दीजिए?"
+    verify_email_prompt = f"आपकी email ID — {email_to_tts(crm_email)} — यही है?" if crm_email else "क्या आप अपनी email ID बता सकते हैं?"
 
-    if crm_pincode:
-        verify_pincode_prompt = f"आपका area pin code — {digits_to_tts(crm_pincode)} — यही है?"
-    else:
-        verify_pincode_prompt = (
-            "मेरे record में pin code available नहीं दिख रहा. "
-            "अगर convenient हो तो अपना area pin code बता दीजिए?"
-        )
-
-    if crm_email:
-        verify_email_prompt = f"आपकी email ID — {email_to_tts(crm_email)} — यही है?"
-    else:
-        verify_email_prompt = (
-            "मेरे record में email ID available नहीं दिख रही. "
-            "अगर convenient हो तो अपनी email ID बता दीजिए?"
-        )
+    wrong_contact_number_prompt = followup_prompt if followup_prompt and session.current_state.name == "COLLECT_WRONG_CONTACT_NUMBER" else "और आपका सही contact number क्या है?"
+    if session.wrong_contact_digit_buffer and not followup_prompt:
+        wrong_contact_number_prompt = "जी, आगे बताइए।"
 
     context = dict(session.__dict__)
     context.update(
         {
             "company_name": company_name,
-            "spoken_crm_pincode": digits_to_tts(crm_pincode),
+            "spoken_crm_pincode": digits_to_tts(recorded_pincode),
             "spoken_crm_email": email_to_tts(crm_email),
             "spoken_current_email": email_to_tts(current_email),
             "spoken_whatsapp_digits": digits_to_tts(whatsapp_digits),
@@ -1379,11 +1546,21 @@ def build_render_context(session: CallSession) -> dict:
             "spoken_concerned_person_digits": digits_to_tts(concerned_person_digits),
             "spoken_pincode_digits": digits_to_tts(pincode_digits),
             "spoken_referral_digits": digits_to_tts(referral_digits),
+            "spoken_referral_pincode_digits": digits_to_tts(referral_pincode_digits),
+            "spoken_wrong_contact_digits": digits_to_tts(wrong_contact_digits),
+            "spoken_mobile_update_digits": digits_to_tts(mobile_update_digits),
+            "spoken_redirect_digits": digits_to_tts(redirect_digits),
+            "spoken_training_pincode_digits": digits_to_tts(training_pincode_digits),
             "concerned_person_label": concerned_person_label,
+            "display_referral_name": display_referral_name,
             "wrong_contact_company_prompt": build_wrong_contact_company_prompt(session),
             "wrong_contact_trade_prompt": build_wrong_contact_trade_prompt(session),
             "wrong_contact_type_prompt": build_wrong_contact_type_prompt(session),
             "wrong_contact_name_prompt": build_wrong_contact_name_prompt(session),
+            "wrong_contact_number_prompt": wrong_contact_number_prompt,
+            "wrong_number_pitch_prompt": build_wrong_number_pitch_prompt(session),
+            "wrong_number_help_check_prompt": build_wrong_number_help_check_prompt(session),
+            "wrong_number_closing_prompt": build_wrong_number_closing_prompt(session),
             "concerned_person_handoff_prompt": concerned_person_handoff_prompt,
             "concerned_person_collection_prompt": concerned_person_prompt,
             "display_business_type": business_type,
@@ -1401,6 +1578,7 @@ def build_render_context(session: CallSession) -> dict:
             "detour_anything_else_prompt": build_detour_anything_else_prompt(session),
             "email_collection_prompt": email_prompt,
             "purchase_amount_prompt": build_purchase_amount_prompt(session),
+            "support_and_referral_prompt": build_support_and_referral_prompt(session),
             "referral_nudge_prompt": build_referral_nudge_prompt(session),
             "busy_nudge_prompt": build_busy_nudge_prompt(session),
             "verify_pincode_prompt": verify_pincode_prompt,
@@ -1409,12 +1587,15 @@ def build_render_context(session: CallSession) -> dict:
             "alternate_collection_prompt": alternate_prompt,
             "pincode_collection_prompt": pincode_prompt,
             "referral_collection_prompt": referral_prompt,
+            "referral_pincode_prompt": referral_pincode_prompt,
             "query_response_prompt": build_query_response_prompt(session),
             "callback_time_prompt": build_callback_time_prompt(session),
             "callback_confirmation_prompt": build_callback_confirmation_prompt(session),
+            "mobile_update_confirmation_prompt": build_mobile_update_confirmation_prompt(session),
             "terminal_closing_text": build_terminal_closing_text(session),
             "fixed_closing_text": build_fixed_closing_text(session),
             "billing_blocker_support_prefix": build_billing_blocker_support_prefix(session),
         }
     )
     return context
+

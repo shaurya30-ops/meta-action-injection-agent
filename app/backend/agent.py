@@ -3,7 +3,7 @@
 Marg ई आर पी Solutions Welcome Call
 
 Architecture: Deterministic State Machine + LLM as Rendering Engine
-Pipeline: Deepgram STT → Qwen2.5-0.5B (Intent) → State Machine → gpt-5.4-nano → Sarvam TTS
+Pipeline: Deepgram STT ? Deterministic Intent Parser ? State Machine ? gpt-5.4-nano ? Sarvam TTS
 """
 
 import os
@@ -42,7 +42,7 @@ from prompts.template_renderer import render_template
 from content_extraction.extractor_logic import build_render_context
 from dispositions.resolver import compute_disposition
 from dispositions.logger import log_call
-from utils.logger import pipeline_logger, log_metric
+from utils.logger import TurnTelemetryTracker, pipeline_logger, log_metric
 from utils.stable_sarvam import StableSarvamTTS
 from utils.transcript import sanitize_user_transcript
 from utils.voice_session import (
@@ -303,6 +303,7 @@ class आकृतिAgent(Agent):
         self.classifier = IntentClassifier()
         self._init_greeting_done = False
         self.ctx = ctx
+        self.telemetry_tracker: TurnTelemetryTracker | None = None
 
     async def _stream_default_llm_with_retries(
         self,
@@ -456,6 +457,9 @@ class आकृतिAgent(Agent):
 
         # ── TERMINAL STATE: End call ──
         if self.session_data.current_state == State.END:
+            if self.telemetry_tracker is not None:
+                self.telemetry_tracker.finalize_pending_turn()
+                self.session_data.telemetry_summary = self.telemetry_tracker.summary()
             self.session_data.main_disposition, self.session_data.sub_disposition = (
                 compute_disposition(self.session_data)
             )
@@ -538,9 +542,15 @@ async def entrypoint(ctx: JobContext):
         conn_options=conn_options,
     )
 
+    agent = आकृतिAgent(crm_data=crm_data, ctx=ctx)
+    telemetry_tracker = TurnTelemetryTracker(agent.session_data)
+    agent.telemetry_tracker = telemetry_tracker
+
     @session.on("metrics_collected")
-    def _on_metrics_collected(metrics):
-        log_metric(metrics)
+    def _on_metrics_collected(event):
+        metrics = getattr(event, "metrics", event)
+        log_metric(metrics, agent.session_data)
+        telemetry_tracker.note_metric(metrics)
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(ev):
@@ -550,8 +560,22 @@ async def entrypoint(ctx: JobContext):
                 ev.transcript,
                 ev.language,
             )
+            telemetry_tracker.note_user_transcript(
+                ev.transcript,
+                language=str(ev.language) if ev.language else None,
+                state=getattr(agent.session_data.current_state, "value", None),
+            )
 
-    agent = आकृतिAgent(crm_data=crm_data, ctx=ctx)
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev):
+        item = getattr(ev, "item", None)
+        if item is not None:
+            telemetry_tracker.note_conversation_item(item)
+
+    @session.on("close")
+    def _on_session_close(_ev):
+        telemetry_tracker.finalize_pending_turn()
+
     await session.start(
         agent=agent,
         room=ctx.room,
@@ -598,20 +622,12 @@ async def entrypoint(ctx: JobContext):
     agent._init_greeting_done = True
 
 
-def prewarm_process(proc):
-    logger.info("Initializing and pre-warming Intent Classifier...")
-    classifier = IntentClassifier()
-    classifier.warmup()
-    logger.info("Intent Classifier fully warmed up and ready.")
-    proc.userdata["intent_classifier"] = classifier
-
 if __name__ == "__main__":
     from livekit.agents import cli
     
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm_process,
             agent_name="आकृति-welcome-call",
             num_idle_processes=1,
             initialize_process_timeout=120.0

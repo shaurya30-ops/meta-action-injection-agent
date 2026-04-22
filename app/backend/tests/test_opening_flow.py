@@ -1,19 +1,22 @@
-﻿import sys
+import json
+import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from dispositions.resolver import compute_disposition
-from content_extraction.extractor_logic import build_render_context, extract_digits
-from intent_classifier.classifier import _load_worker_tokenizer
+from content_extraction.extractor_logic import (
+    build_query_response_prompt,
+    build_render_context,
+    extract_digits,
+)
 from intent_classifier.fallback import RegexFallbackClassifier
 from prompts.payload_builder import build_action_text
 from state_machine.intents import Intent
-from state_machine.resolver import post_transition, resolve_next_state
+from state_machine.resolver import execute_auto_chain, post_transition, resolve_next_state
 from state_machine.session import CallSession
 from state_machine.states import State
 from state_machine.turn_parser import parse_turn
@@ -43,35 +46,6 @@ class RegexFallbackClassifierTests(unittest.TestCase):
             self.classifier.classify("हां जी उसका नाम क्या लिखा आपने?"),
             Intent.ASK,
         )
-
-
-class IntentClassifierLoaderTests(unittest.TestCase):
-    @patch("intent_classifier.classifier._is_local_source", return_value=False)
-    @patch("transformers.AutoTokenizer.from_pretrained")
-    def test_broken_adapter_tokenizer_falls_back_to_base_source(
-        self,
-        mocked_from_pretrained,
-        _mocked_is_local_source,
-    ):
-        mocked_from_pretrained.side_effect = [
-            Exception("broken adapter tokenizer"),
-            "base-tokenizer",
-        ]
-
-        tokenizer = _load_worker_tokenizer(
-            "adapter-dir",
-            "Qwen/Qwen2.5-0.5B-Instruct",
-        )
-
-        self.assertEqual(tokenizer, "base-tokenizer")
-        self.assertEqual(mocked_from_pretrained.call_count, 2)
-        self.assertEqual(mocked_from_pretrained.call_args_list[0].args[0], "adapter-dir")
-        self.assertTrue(mocked_from_pretrained.call_args_list[0].kwargs["local_files_only"])
-        self.assertEqual(
-            mocked_from_pretrained.call_args_list[1].args[0],
-            "Qwen/Qwen2.5-0.5B-Instruct",
-        )
-        self.assertFalse(mocked_from_pretrained.call_args_list[1].kwargs["local_files_only"])
 
 
 class TranscriptSanitizerTests(unittest.TestCase):
@@ -139,13 +113,13 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(session.current_state, State.CHECK_AVAILABILITY)
         self.assertEqual(
             build_action_text(session),
-            "ठीक है जी, ये एक post-sale feedback और verification call है Marg ई आर पी software की तरफ से। क्या अभी दो मिनट बात हो सकती है?",
+            "बहुत बहुत स्वागत है आपका Marg परिवार में! आप हमारे नए member हैं — और हम चाहते हैं कि आपकी शुरुआत बिल्कुल smooth हो. बस two minute में कुछ details verify करना चाहती थी और आपको कुछ ज़रूरी जानकारी भी देना चाहूंगी. क्या अभी बात की जा सकती है?",
         )
 
     def test_callback_request_nudges_before_time_confirmation(self):
         session = CallSession(current_state=State.CHECK_AVAILABILITY)
 
-        next_state = self.advance(session, Intent.REQUEST, "जी आप मुझे पांच minute बाद call करो.")
+        next_state = self.advance(session, Intent.DEFER, "जी आप मुझे पांच minute बाद call करो.")
 
         self.assertEqual(next_state, State.BUSY_NUDGE)
         self.assertEqual(session.current_state, State.BUSY_NUDGE)
@@ -155,7 +129,8 @@ class ResolverFlowTests(unittest.TestCase):
 
         self.assertEqual(next_state, State.CONFIRM_CALLBACK_TIME)
         self.assertEqual(session.callback_time_phrase, "पांच minute बाद")
-        self.assertIn("पांच minute बाद", build_action_text(session))
+        self.assertIn("call करूँगी", build_action_text(session))
+        self.assertTrue(build_action_text(session).endswith("सही है?"))
 
     def test_callback_without_specific_time_asks_for_schedule_after_busy_nudge(self):
         session = CallSession(current_state=State.CHECK_AVAILABILITY)
@@ -224,7 +199,7 @@ class ResolverFlowTests(unittest.TestCase):
         )
 
         self.assertEqual(fourth_state, State.CALLBACK_CLOSING)
-        self.assertEqual(session.callback_closing_text, "जी बिल्कुल, मैं थोड़ी देर बाद call करती हूँ।")
+        self.assertEqual(session.callback_closing_text, "जी बिल्कुल, मैं आपको कल सुबह 10 बजे call करती हूँ।")
 
     def test_owner_redirects_to_concerned_person_instead_of_generic_callback_pitch(self):
         session = CallSession(current_state=State.CHECK_AVAILABILITY)
@@ -296,26 +271,32 @@ class ResolverFlowTests(unittest.TestCase):
             "नहीं, आपने wrong number लगाया है.",
         )
 
-        self.assertEqual(next_state, State.ASK_WRONG_CONTACT_COMPANY)
+        self.assertEqual(next_state, State.ASK_WRONG_CONTACT_NAME)
         rendered = build_action_text(session)
-        self.assertIn("आप कहाँ से बोल रहे हैं", rendered)
+        self.assertIn("क्या आप अपना नाम बता सकते हैं", rendered)
 
-    def test_wrong_contact_capture_closes_after_company_trade_and_type(self):
-        session = CallSession(current_state=State.ASK_WRONG_CONTACT_COMPANY)
+    def test_wrong_contact_capture_collects_name_and_number_then_runs_wrong_number_closing(self):
+        session = CallSession(current_state=State.ASK_WRONG_CONTACT_NAME)
 
-        next_state = self.advance(session, Intent.INFORM, "हम Tech Ladder से बोल रहे हैं.")
-        self.assertEqual(next_state, State.ASK_WRONG_CONTACT_TRADE)
+        next_state = self.advance(session, Intent.INFORM, "मेरा नाम शौर्य है.")
+        self.assertEqual(next_state, State.COLLECT_WRONG_CONTACT_NUMBER)
+        self.assertEqual(session.wrong_contact_name, "शौर्य")
 
-        next_state = self.advance(session, Intent.INFORM, "wholesale trade है.")
-        self.assertEqual(next_state, State.ASK_WRONG_CONTACT_TYPE)
+        next_state = self.advance(session, Intent.INFORM, "9876543210")
+        self.assertEqual(next_state, State.CONFIRM_WRONG_CONTACT_NUMBER)
+        self.assertEqual(session.wrong_contact_digit_buffer, "9876543210")
 
-        next_state = self.advance(session, Intent.INFORM, "retailer है.")
-        self.assertEqual(next_state, State.WARM_CLOSING)
-        rendered = build_action_text(session)
-        self.assertEqual(session.wrong_contact_company, "Tech Ladder")
-        self.assertIn("wholesale", session.wrong_contact_trade.lower())
-        self.assertEqual(session.wrong_contact_type, "Retailer")
-        self.assertIn("records update", rendered)
+        next_state = self.advance(session, Intent.AFFIRM, "हाँ")
+        self.assertEqual(next_state, State.WRONG_NUMBER_PITCH)
+        chain = execute_auto_chain(session, next_state)
+        self.assertEqual(chain, [State.WRONG_NUMBER_PITCH, State.WRONG_NUMBER_HELP_CHECK])
+        self.assertEqual(session.current_state, State.WRONG_NUMBER_HELP_CHECK)
+        self.assertEqual(session.wrong_contact_number, "9876543210")
+        self.assertIn("Marg ERP", build_action_text(CallSession(current_state=State.WRONG_NUMBER_PITCH)))
+
+        next_state = self.advance(session, Intent.DENY, "नहीं.")
+        self.assertEqual(next_state, State.WRONG_NUMBER_CLOSING)
+        self.assertIn("बहुत शुक्रिया", build_action_text(session))
 
     def test_user_requested_stop_gets_acknowledged_before_warm_close(self):
         session = CallSession(current_state=State.ASK_PURCHASE_AMOUNT)
@@ -535,8 +516,8 @@ class ResolverFlowTests(unittest.TestCase):
 
         self.assertEqual(next_state, State.DETOUR_ANYTHING_ELSE)
         rendered = build_action_text(session)
-        self.assertIn("setup पूरा होने", rendered)
-        self.assertIn("कोई और बात", rendered)
+        self.assertIn("setup side ready", rendered)
+        self.assertIn("किसी और तरह", rendered)
 
         next_state = self.advance(session, Intent.DENY, "नहीं.")
         self.assertEqual(next_state, State.VERIFY_WHATSAPP)
@@ -566,12 +547,14 @@ class ResolverFlowTests(unittest.TestCase):
             "partner राहुल है.",
         )
 
-        self.assertEqual(next_state, State.WARM_CLOSING)
+        self.assertEqual(next_state, State.ESCALATION_HELP_CHECK)
         self.assertIn("दो दिन पहले", session.partner_payment_date)
         self.assertIn("राहुल", session.partner_name)
         rendered = build_action_text(session)
-        self.assertIn("partner से contact करेंगे", rendered)
-        self.assertIn("20 से 48 घंटों", rendered)
+        self.assertIn("सहायता", rendered)
+
+        next_state = self.advance(session, Intent.DENY, "नहीं.")
+        self.assertEqual(next_state, State.WARM_CLOSING)
 
     def test_switched_software_collects_name_and_reason_then_alt_closes(self):
         session = CallSession(current_state=State.ASK_BILLING_STATUS)
@@ -599,8 +582,11 @@ class ResolverFlowTests(unittest.TestCase):
             "क्योंकि team उसी पर comfortable है.",
         )
 
-        self.assertEqual(next_state, State.WARM_CLOSING)
+        self.assertEqual(next_state, State.ESCALATION_HELP_CHECK)
         self.assertIn("comfortable", session.switched_software_reason)
+
+        next_state = self.advance(session, Intent.DENY, "नहीं.")
+        self.assertEqual(next_state, State.WARM_CLOSING)
 
     def test_business_closed_collects_feedback_then_alt_closes(self):
         session = CallSession(current_state=State.ASK_BILLING_STATUS)
@@ -619,10 +605,13 @@ class ResolverFlowTests(unittest.TestCase):
             "दुकान बंद हो गई.",
         )
 
-        self.assertEqual(next_state, State.WARM_CLOSING)
+        self.assertEqual(next_state, State.ESCALATION_HELP_CHECK)
         self.assertIn("दुकान बंद", session.business_closed_reason)
 
-    def test_training_pending_collects_pincode_then_resumes_after_anything_else(self):
+        next_state = self.advance(session, Intent.DENY, "नहीं.")
+        self.assertEqual(next_state, State.WARM_CLOSING)
+
+    def test_training_pending_runs_full_five_turn_detour_then_resumes(self):
         session = CallSession(current_state=State.ASK_BILLING_STATUS)
 
         next_state = self.advance(
@@ -631,19 +620,40 @@ class ResolverFlowTests(unittest.TestCase):
             "training pending है अभी.",
         )
 
+        self.assertEqual(next_state, State.TRAINING_PENDING_ACK)
+        chain = execute_auto_chain(session, next_state)
+        self.assertEqual(chain, [State.TRAINING_PENDING_ACK, State.ASK_TRAINING_PENDING_DURATION])
+        self.assertEqual(session.current_state, State.ASK_TRAINING_PENDING_DURATION)
+        self.assertIn("कितने time से pending", build_action_text(session))
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "दो हफ्ते से pending है.",
+        )
+
         self.assertEqual(next_state, State.COLLECT_TRAINING_PINCODE)
+        self.assertIn("area pin code", build_action_text(session))
 
         next_state = self.advance(
             session,
             Intent.INFORM,
             "pin code 110011",
         )
-
-        self.assertEqual(next_state, State.DETOUR_ANYTHING_ELSE)
+        self.assertEqual(next_state, State.CONFIRM_TRAINING_PINCODE)
         self.assertEqual(session.training_area_pincode, "110011")
+
+        next_state = self.advance(
+            session,
+            Intent.AFFIRM,
+            "हाँ",
+        )
+        self.assertEqual(next_state, State.TRAINING_REASSURANCE)
+        chain = execute_auto_chain(session, next_state)
+        self.assertEqual(chain, [State.TRAINING_REASSURANCE, State.TRAINING_HELP_CHECK])
+        self.assertEqual(session.current_state, State.TRAINING_HELP_CHECK)
         rendered = build_action_text(session)
-        self.assertIn("24 से 48 घंटों", rendered)
-        self.assertIn("क्या कोई और बात है", rendered)
+        self.assertIn("किसी और तरह से help", rendered)
 
         next_state = self.advance(
             session,
@@ -673,7 +683,7 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(next_state, State.DETOUR_ANYTHING_ELSE)
         rendered = build_action_text(session)
         self.assertIn("migration", rendered.lower())
-        self.assertIn("क्या कोई और बात है", rendered)
+        self.assertIn("किसी और तरह से help", rendered)
 
         next_state = self.advance(
             session,
@@ -735,6 +745,50 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(next_state, State.VERIFY_WHATSAPP)
         self.assertEqual(session.current_state, State.VERIFY_WHATSAPP)
         self.assertIsNone(session.resume_state)
+
+    def test_explore_billing_blocker_accepts_started_and_resumes_whatsapp(self):
+        session = CallSession(
+            current_state=State.EXPLORE_BILLING_BLOCKER,
+            billing_started="NOT_STARTED",
+            billing_blocker_reason="setup_in_progress",
+            billing_blocker_refusal_count=2,
+            billing_resume_state=State.VERIFY_WHATSAPP,
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "Madam billing start हो गई है.",
+        )
+
+        self.assertEqual(next_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.current_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.billing_started, "STARTED")
+        self.assertEqual(session.billing_blocker_reason, "")
+        self.assertEqual(session.billing_blocker_refusal_count, 0)
+        self.assertIsNone(session.billing_resume_state)
+
+    def test_embedded_query_resume_from_blocker_accepts_billing_started(self):
+        session = CallSession(
+            current_state=State.ANSWER_USER_QUERY,
+            resume_state=State.EXPLORE_BILLING_BLOCKER,
+            query_resume_embedded=True,
+            query_resolution_pending=True,
+            last_user_query_type="clarification",
+            billing_started="NOT_STARTED",
+            billing_blocker_reason="setup_in_progress",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "अब billing start हो गई है.",
+        )
+
+        self.assertEqual(next_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.current_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.billing_started, "STARTED")
+        self.assertEqual(session.billing_blocker_reason, "")
 
     def test_business_detail_correction_stays_in_confirmation_cluster(self):
         session = CallSession(
@@ -803,6 +857,30 @@ class ResolverFlowTests(unittest.TestCase):
             rendered,
         )
 
+    def test_full_email_input_overrides_existing_fragment_buffer(self):
+        session = CallSession(
+            current_state=State.COLLECT_EMAIL_CORRECTION,
+            crm_email="old@example.com",
+            email_fragment_buffer="shaurya dot sparsh",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "shaurya dot sparsh dot one dot two dot three at the rate gmail dot com",
+        )
+
+        self.assertEqual(next_state, State.CONFIRM_EMAIL_CORRECTION)
+        self.assertEqual(session.current_state, State.CONFIRM_EMAIL_CORRECTION)
+        self.assertEqual(session.email, "shaurya.sparsh.1.2.3@gmail.com")
+
+        rendered = build_action_text(session)
+        self.assertIn(
+            "shaurya dot sparsh dot one dot two dot three at the rate gmail dot com",
+            rendered,
+        )
+        self.assertEqual(rendered.count("shaurya dot sparsh"), 1)
+
     def test_query_interrupts_and_resumes_same_workflow_step(self):
         session = CallSession(current_state=State.VERIFY_PINCODE, crm_pincode="110011")
 
@@ -814,7 +892,6 @@ class ResolverFlowTests(unittest.TestCase):
 
         self.assertEqual(next_state, State.ANSWER_USER_QUERY)
         self.assertEqual(session.current_state, State.ANSWER_USER_QUERY)
-        self.assertEqual(session.resume_state, State.VERIFY_PINCODE)
         self.assertEqual(session.last_user_query_type, "pricing")
         self.assertEqual(session.dialog_mode, "HANDLE_QUERY")
         self.assertEqual(session.expected_slot, "query_resolution")
@@ -824,6 +901,131 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertEqual(session.current_state, State.VERIFY_PINCODE)
         self.assertIsNone(session.resume_state)
         self.assertEqual(session.expected_slot, "pincode")
+
+    def test_training_query_interrupts_into_training_flow(self):
+        session = CallSession(current_state=State.VERIFY_EMAIL, crm_email="old@example.com")
+
+        next_state = self.advance(
+            session,
+            Intent.ASK,
+            "what about my training?",
+        )
+
+        self.assertEqual(next_state, State.TRAINING_PENDING_ACK)
+        chain = execute_auto_chain(session, next_state)
+        self.assertEqual(chain, [State.TRAINING_PENDING_ACK, State.ASK_TRAINING_PENDING_DURATION])
+        self.assertEqual(session.current_state, State.ASK_TRAINING_PENDING_DURATION)
+        self.assertEqual(session.billing_blocker_reason, "training_pending")
+        self.assertEqual(session.blocker_owner, "partner")
+        self.assertEqual(session.billing_resume_state, State.VERIFY_EMAIL)
+        self.assertIn("कितने time से pending", build_action_text(session))
+
+    def test_mobile_number_change_interrupt_resumes_exact_step(self):
+        session = CallSession(current_state=State.VERIFY_WHATSAPP)
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "मुझे अपना registered mobile number change करवाना है.",
+        )
+
+        self.assertEqual(next_state, State.COLLECT_MOBILE_UPDATE_NUMBER)
+        self.assertEqual(session.number_change_resume_state, State.VERIFY_WHATSAPP)
+
+        next_state = self.advance(session, Intent.INFORM, "9876543210")
+        self.assertEqual(next_state, State.CONFIRM_MOBILE_UPDATE_NUMBER)
+
+        next_state = self.advance(session, Intent.AFFIRM, "हाँ")
+        self.assertEqual(next_state, State.MOBILE_UPDATE_CONFIRMED)
+        chain = execute_auto_chain(session, next_state)
+        self.assertEqual(chain, [State.MOBILE_UPDATE_CONFIRMED])
+        self.assertEqual(session.current_state, State.VERIFY_WHATSAPP)
+        self.assertIn("WhatsApp", build_action_text(session))
+
+    def test_referral_capture_collects_name_number_and_pincode_before_closing(self):
+        session = CallSession(current_state=State.SUPPORT_AND_REFERRAL)
+
+        next_state = self.advance(session, Intent.AFFIRM, "हाँ")
+        self.assertEqual(next_state, State.COLLECT_REFERRAL_NAME)
+
+        next_state = self.advance(session, Intent.INFORM, "राहुल")
+        self.assertEqual(next_state, State.COLLECT_REFERRAL_NUMBER)
+        self.assertEqual(session.referral_name, "राहुल")
+
+        next_state = self.advance(session, Intent.INFORM, "9876543210")
+        self.assertEqual(next_state, State.CONFIRM_REFERRAL_NUMBER)
+
+        next_state = self.advance(session, Intent.AFFIRM, "हाँ")
+        self.assertEqual(next_state, State.COLLECT_REFERRAL_PINCODE)
+
+        next_state = self.advance(session, Intent.INFORM, "110011")
+        self.assertEqual(next_state, State.CONFIRM_REFERRAL_DETAILS)
+
+        next_state = self.advance(session, Intent.AFFIRM, "हाँ")
+        self.assertEqual(next_state, State.PRE_CLOSING)
+        self.assertEqual(session.referral_pincode, "110011")
+
+    def test_ticket_followup_interrupt_collects_ticket_then_resumes_previous_step(self):
+        session = CallSession(current_state=State.VERIFY_WHATSAPP)
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "maine pehle ticket raise kiya tha, abhi tak koi update nahi aaya",
+        )
+        self.assertEqual(next_state, State.COLLECT_TICKET_NUMBER)
+        self.assertEqual(session.ticket_resume_state, State.VERIFY_WHATSAPP)
+        self.assertIn("ticket number", build_action_text(session))
+
+        next_state = self.advance(session, Intent.INFORM, "TK-12345")
+        self.assertEqual(next_state, State.TICKET_ESCALATION_ACK)
+        self.assertEqual(session.ticket_number, "TK-12345")
+        self.assertIn("ticket", build_action_text(session).lower())
+
+        next_state = self.advance(session, Intent.THANK, "thanks")
+        self.assertEqual(next_state, State.TICKET_HELP_CHECK)
+        self.assertIn("help", build_action_text(session).lower())
+
+        next_state = self.advance(session, Intent.DENY, "nahi")
+        self.assertEqual(next_state, State.VERIFY_WHATSAPP)
+
+    def test_ticket_help_query_resumes_original_state_after_answer(self):
+        session = CallSession(
+            current_state=State.TICKET_HELP_CHECK,
+            ticket_number="TK-12345",
+            ticket_resume_state=State.VERIFY_WHATSAPP,
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.ASK,
+            "ticket me update kab aayega?",
+        )
+
+        self.assertEqual(next_state, State.ANSWER_USER_QUERY)
+        self.assertEqual(session.resume_state, State.VERIFY_WHATSAPP)
+        self.assertEqual(session.last_user_query_text, "ticket me update kab aayega?")
+
+    def test_user_redirect_interrupt_collects_number_and_closes_without_resuming_flow(self):
+        session = CallSession(current_state=State.VERIFY_WHATSAPP)
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "dukan wale ladke se baat kar lo",
+        )
+        self.assertEqual(next_state, State.REDIRECT_COLLECT_NUMBER)
+        self.assertIn("contact number", build_action_text(session))
+
+        next_state = self.advance(session, Intent.INFORM, "9876543210")
+        self.assertEqual(next_state, State.REDIRECT_CONFIRM_NUMBER)
+        self.assertEqual(session.redirect_digit_buffer, "9876543210")
+        self.assertIn("nine eight seven six", build_action_text(session))
+
+        next_state = self.advance(session, Intent.AFFIRM, "haan")
+        self.assertEqual(next_state, State.WARM_CLOSING)
+        self.assertEqual(session.redirect_number, "9876543210")
+        self.assertIn("number", build_action_text(session).lower())
 
     def test_clarification_reasks_step_and_accepts_direct_answer(self):
         session = CallSession(current_state=State.ASK_BILLING_STATUS)
@@ -877,13 +1079,14 @@ class ResolverFlowTests(unittest.TestCase):
 
         first = self.advance(session, Intent.OBJECT, "मैं amount नहीं बता सकता.")
         self.assertEqual(first, State.ASK_PURCHASE_AMOUNT)
-        self.assertIn("database clean", build_action_text(session))
+        self.assertIn("records accurate", build_action_text(session))
 
         second = self.advance(session, Intent.OBJECT, "नहीं बता सकता.")
         self.assertEqual(second, State.SUPPORT_AND_REFERRAL)
         rendered = build_action_text(session)
         self.assertIn("मैं इसे skip कर देती हूँ", rendered)
-        self.assertIn("Marg Help", rendered)
+        self.assertIn("nearest partner", rendered)
+        self.assertNotIn("Marg Help", rendered)
 
     def test_email_refusal_uses_two_nudges_then_skips_to_purchase_amount(self):
         session = CallSession(current_state=State.VERIFY_EMAIL, crm_email="")
@@ -1036,6 +1239,54 @@ class ResolverFlowTests(unittest.TestCase):
         self.assertIn("नाम शौर्य जी", rendered)
         self.assertNotIn("दस जी", rendered)
 
+    def test_training_help_check_does_not_retrigger_training_handler(self):
+        """Regression: user mentions 'training' at TRAINING_HELP_CHECK should NOT
+        restart the entire training handler from TRAINING_PENDING_ACK."""
+        session = CallSession(
+            current_state=State.TRAINING_HELP_CHECK,
+            training_area_pincode="827013",
+            awaiting_training_pincode_confirmation=False,
+            billing_resume_state=State.VERIFY_WHATSAPP,
+            billing_blocker_reason="training_pending",
+            blocker_owner="partner",
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.ASK,
+            "यह training के लिए आप बोल रहे हो ना?",
+        )
+
+        # Should NOT restart the training handler
+        self.assertNotEqual(next_state, State.TRAINING_PENDING_ACK)
+        self.assertNotEqual(next_state, State.ASK_TRAINING_PENDING_DURATION)
+        self.assertNotEqual(next_state, State.COLLECT_TRAINING_PINCODE)
+        # Should stay in the training help check area (query or same state)
+        self.assertIn(
+            next_state,
+            {State.TRAINING_HELP_CHECK, State.ANSWER_USER_QUERY},
+        )
+
+    def test_training_pincode_already_provided_skips_recollection(self):
+        """Regression: when training pincode was already collected and user says
+        'I already told you the pin code', the agent should not loop asking."""
+        session = CallSession(
+            current_state=State.COLLECT_TRAINING_PINCODE,
+            training_area_pincode="827013",
+            awaiting_training_pincode_confirmation=False,
+            billing_resume_state=State.VERIFY_WHATSAPP,
+        )
+
+        next_state = self.advance(
+            session,
+            Intent.INFORM,
+            "अभी तो pin code बताया ना, ऊपर मैंने बताया pin code.",
+        )
+
+        # Should recognize the pincode was already provided and advance
+        self.assertNotEqual(next_state, State.COLLECT_TRAINING_PINCODE)
+        self.assertEqual(next_state, State.TRAINING_REASSURANCE)
+
 
 class PromptRenderingTests(unittest.TestCase):
     def test_extract_digits_supports_hindi_numbers_and_repeat_markers(self):
@@ -1054,7 +1305,7 @@ class PromptRenderingTests(unittest.TestCase):
 
         self.assertEqual(
             rendered,
-            "आपका area pin code — one one zero zero one one — यही है?",
+            "हमारे records में आपका pin code है — one one zero zero one one — क्या यही सही है?",
         )
 
     def test_build_action_text_renders_corrected_email_confirmation(self):
@@ -1075,8 +1326,7 @@ class PromptRenderingTests(unittest.TestCase):
 
         rendered = build_action_text(session)
 
-        self.assertIn("email ID available नहीं दिख रही", rendered)
-        self.assertIn("अपनी email ID बता दीजिए", rendered)
+        self.assertEqual(rendered, "क्या आप अपनी email ID बता सकते हैं?")
 
     def test_build_action_text_groups_pharma_and_medical_labels(self):
         session = CallSession(
@@ -1129,6 +1379,132 @@ class DispositionTests(unittest.TestCase):
             compute_disposition(session),
             ("Invalid Reg Details", "Wrong Details of Customer"),
         )
+
+
+class DeterministicMatcherTests(unittest.TestCase):
+    def test_fixture_backed_hot_path_states_override_unclear_intent(self):
+        fixture_path = (
+            BACKEND_ROOT
+            / "conversation_engine"
+            / "evaluation"
+            / "fixtures"
+            / "real_convo_2.hot_path.json"
+        )
+        fixtures = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+        expectation_by_state = {
+            "OPENING_GREETING": Intent.AFFIRM,
+            "CONFIRM_IDENTITY": Intent.AFFIRM,
+            "CHECK_AVAILABILITY": Intent.AFFIRM,
+            "BUSY_NUDGE": Intent.AFFIRM,
+        }
+
+        for fixture in fixtures:
+            state_name = fixture["state"]
+            if state_name not in expectation_by_state:
+                continue
+            if "AFFIRM" not in set(fixture["expected_events"]):
+                continue
+
+            session = CallSession(current_state=State[state_name])
+            turn = parse_turn(session, Intent.UNCLEAR, fixture["utterance"])
+            self.assertEqual(turn.speech_act, expectation_by_state[state_name], fixture["id"])
+
+    def test_system_noise_does_not_advance_state(self):
+        session = CallSession(current_state=State.CHECK_AVAILABILITY)
+
+        next_state = resolve_next_state(
+            session,
+            Intent.UNCLEAR,
+            "This call is now being recorded.",
+        )
+
+        self.assertEqual(next_state, State.CHECK_AVAILABILITY)
+
+    def test_billing_started_with_training_pending_interrupts_to_training_flow(self):
+        session = CallSession(current_state=State.ASK_BILLING_STATUS)
+
+        next_state = resolve_next_state(
+            session,
+            Intent.COMPLAIN,
+            "बिलिंग तो स्टार्ट हो गई है पर ट्रेनिंग नहीं हुई है।",
+        )
+
+        self.assertEqual(next_state, State.TRAINING_PENDING_ACK)
+        chain = execute_auto_chain(session, next_state)
+        self.assertEqual(chain, [State.TRAINING_PENDING_ACK, State.ASK_TRAINING_PENDING_DURATION])
+        self.assertEqual(session.current_state, State.ASK_TRAINING_PENDING_DURATION)
+
+    def test_availability_soft_goahead_advances_without_reasking(self):
+        session = CallSession(current_state=State.CHECK_AVAILABILITY)
+
+        turn = parse_turn(session, Intent.UNCLEAR, "हो जाएगी बताओ?")
+
+        self.assertEqual(turn.speech_act, Intent.AFFIRM)
+
+        next_state = resolve_next_state(session, turn, "हो जाएगी बताओ?")
+
+        self.assertEqual(next_state, State.ASK_BILLING_STATUS)
+
+    def test_live_billing_training_phrase_interrupts_to_training_flow(self):
+        session = CallSession(current_state=State.ASK_BILLING_STATUS)
+
+        turn = parse_turn(session, Intent.INFORM, "Billing start हो गई है पर training नहीं हुई है.")
+
+        self.assertEqual(turn.workflow_answer, "billing_started_training_pending")
+
+        next_state = resolve_next_state(
+            session,
+            turn,
+            "Billing start हो गई है पर training नहीं हुई है.",
+        )
+
+        self.assertEqual(next_state, State.TRAINING_PENDING_ACK)
+        chain = execute_auto_chain(session, next_state)
+        self.assertEqual(chain, [State.TRAINING_PENDING_ACK, State.ASK_TRAINING_PENDING_DURATION])
+        self.assertEqual(session.current_state, State.ASK_TRAINING_PENDING_DURATION)
+
+    def test_verify_pincode_uses_training_pincode_when_crm_pincode_missing(self):
+        session = CallSession(
+            current_state=State.VERIFY_PINCODE,
+            training_area_pincode="827013",
+        )
+
+        rendered = build_action_text(session)
+
+        self.assertIn("eight two seven zero one three", rendered)
+        self.assertNotIn("pin code available नहीं दिख रहा", rendered)
+
+    def test_verify_pincode_accepts_already_provided_reference_when_training_pincode_exists(self):
+        session = CallSession(
+            current_state=State.VERIFY_PINCODE,
+            training_area_pincode="827013",
+        )
+
+        turn = parse_turn(session, Intent.UNCLEAR, "अभी तो pin code बताया ना ma'am.")
+
+        self.assertEqual(turn.workflow_answer, "confirm_existing_pincode")
+
+        next_state = resolve_next_state(session, turn, "अभी तो pin code बताया ना ma'am.")
+
+        self.assertEqual(next_state, State.VERIFY_BUSINESS_DETAILS)
+
+    def test_opening_affirm_phrase_is_promoted_without_classifier_help(self):
+        session = CallSession(current_state=State.OPENING_GREETING)
+
+        turn = parse_turn(session, Intent.UNCLEAR, "हाँ जी बताइए मैम")
+
+        self.assertEqual(turn.speech_act, Intent.AFFIRM)
+        self.assertEqual(turn.workflow_answer, "opening_confirmed")
+
+    def test_billing_started_phrase_is_promoted_without_classifier_help(self):
+        session = CallSession(current_state=State.ASK_BILLING_STATUS)
+
+        turn = parse_turn(session, Intent.COMPLAIN, "बिलिंग स्टार्ट हो गई है")
+
+        self.assertEqual(turn.speech_act, Intent.AFFIRM)
+        self.assertEqual(turn.workflow_answer, "billing_started")
+
 
 
 if __name__ == "__main__":

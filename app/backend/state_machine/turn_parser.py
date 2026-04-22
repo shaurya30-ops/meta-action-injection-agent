@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import re
 
+from conversation_engine.hot_path.parser import match_state_grammar
 from content_extraction.extractor_logic import (
     billing_started,
     extract_business_details,
@@ -67,6 +68,214 @@ class TurnFrame:
     wants_resume: bool = False
     wants_closure: bool = False
     transcript: str = ""
+
+
+_GRAMMAR_INTENT_OVERRIDES: dict[State, dict[str, Intent]] = {
+    State.OPENING_GREETING: {
+        "AFFIRM": Intent.AFFIRM,
+        "ASK": Intent.ASK,
+        "WRONG_PERSON": Intent.DENY,
+    },
+    State.CONFIRM_IDENTITY: {
+        "AFFIRM": Intent.AFFIRM,
+        "ASK": Intent.ASK,
+        "WRONG_PERSON": Intent.DENY,
+    },
+    State.CHECK_AVAILABILITY: {
+        "AFFIRM": Intent.AFFIRM,
+        "ASK": Intent.ASK,
+        "DEFER": Intent.DEFER,
+        "CALLBACK_REQUESTED": Intent.DEFER,
+        "SYSTEM_NOISE": Intent.UNCLEAR,
+    },
+    State.BUSY_NUDGE: {
+        "AFFIRM": Intent.AFFIRM,
+        "DEFER": Intent.DEFER,
+        "CALLBACK_REQUESTED": Intent.DEFER,
+    },
+    State.ASK_BILLING_STATUS: {
+        "BILLING_STARTED": Intent.AFFIRM,
+        "BILLING_NOT_STARTED": Intent.DENY,
+        "TRAINING_PENDING": Intent.INFORM,
+        "INSTALLATION_PENDING": Intent.DENY,
+    },
+    State.EXPLORE_BILLING_BLOCKER: {
+        "BILLING_STARTED": Intent.AFFIRM,
+        "TRAINING_PENDING": Intent.INFORM,
+        "INSTALLATION_PENDING": Intent.INFORM,
+        "DENY": Intent.DENY,
+        "INFORM": Intent.INFORM,
+    },
+    State.VERIFY_WHATSAPP: {
+        "WHATSAPP_AVAILABLE": Intent.AFFIRM,
+        "WHATSAPP_UNAVAILABLE": Intent.DENY,
+        "TRAINING_PENDING": Intent.INFORM,
+    },
+    State.ASK_ALTERNATE_NUMBER: {
+        "AFFIRM": Intent.AFFIRM,
+        "DENY": Intent.DENY,
+    },
+    State.VERIFY_PINCODE: {
+        "AFFIRM": Intent.AFFIRM,
+        "UNCLEAR": Intent.DENY,
+    },
+    State.VERIFY_BUSINESS_DETAILS: {
+        "AFFIRM": Intent.AFFIRM,
+        "INFORM": Intent.INFORM,
+    },
+    State.CONFIRM_BUSINESS_DETAILS: {
+        "AFFIRM": Intent.AFFIRM,
+        "INFORM": Intent.INFORM,
+    },
+    State.VERIFY_EMAIL: {
+        "AFFIRM": Intent.AFFIRM,
+        "INFORM": Intent.INFORM,
+    },
+    State.COLLECT_EMAIL_CORRECTION: {
+        "INFORM": Intent.INFORM,
+        "DENY": Intent.OBJECT,
+    },
+    State.CONFIRM_EMAIL_CORRECTION: {
+        "AFFIRM": Intent.AFFIRM,
+        "INFORM": Intent.INFORM,
+    },
+    State.ASK_PURCHASE_AMOUNT: {
+        "INFORM": Intent.INFORM,
+        "DENY": Intent.OBJECT,
+    },
+    State.SUPPORT_AND_REFERRAL: {
+        "AFFIRM": Intent.AFFIRM,
+        "DENY": Intent.DENY,
+    },
+    State.REFERRAL_DECLINE_NUDGE: {
+        "AFFIRM": Intent.AFFIRM,
+        "DENY": Intent.DENY,
+    },
+    State.ASK_CALLBACK_TIME: {
+        "CALLBACK_REQUESTED": Intent.DEFER,
+    },
+    State.CONFIRM_CALLBACK_TIME: {
+        "AFFIRM": Intent.AFFIRM,
+        "CALLBACK_REQUESTED": Intent.DEFER,
+    },
+}
+
+
+def _match_state_grammar_rule(state: State, transcript: str):
+    return match_state_grammar(state.value, transcript).rule
+
+
+def _override_speech_act_with_state_grammar(
+    state: State,
+    transcript: str,
+    default_intent: Intent,
+) -> Intent:
+    rule = _match_state_grammar_rule(state, transcript)
+    if rule is None:
+        return default_intent
+
+    overrides = _GRAMMAR_INTENT_OVERRIDES.get(state, {})
+    for emitted in rule.emits:
+        if emitted in overrides:
+            return overrides[emitted]
+    return default_intent
+
+
+def _workflow_answer_from_state_grammar(state: State, transcript: str) -> str | None:
+    rule = _match_state_grammar_rule(state, transcript)
+    if rule is None:
+        return None
+
+    emitted = set(rule.emits)
+
+    if state in {State.OPENING_GREETING, State.CONFIRM_IDENTITY}:
+        if "WRONG_PERSON" in emitted:
+            return "opening_wrong_registration"
+        if "AFFIRM" in emitted:
+            return "opening_confirmed"
+        return None
+
+    if state == State.CHECK_AVAILABILITY:
+        if "SYSTEM_NOISE" in emitted:
+            return "system_noise"
+        return None
+
+    if state == State.ASK_BILLING_STATUS:
+        if {"BILLING_STARTED", "TRAINING_PENDING"}.issubset(emitted):
+            return "billing_started_training_pending"
+        if "BILLING_STARTED" in emitted:
+            return "billing_started"
+        if "BILLING_NOT_STARTED" in emitted:
+            return "billing_not_started"
+
+    if state == State.EXPLORE_BILLING_BLOCKER:
+        if "BILLING_STARTED" in emitted:
+            return "billing_started"
+        if "TRAINING_PENDING" in emitted:
+            return "training_pending_interrupt"
+        if "INSTALLATION_PENDING" in emitted or "INFORM" in emitted:
+            return "billing_blocker_reason_provided"
+        if "DENY" in emitted:
+            return "billing_blocker_refused"
+
+    if state == State.VERIFY_WHATSAPP:
+        if {"WHATSAPP_AVAILABLE", "TRAINING_PENDING"}.issubset(emitted):
+            return "training_pending_interrupt"
+        if "WHATSAPP_AVAILABLE" in emitted:
+            return "same_whatsapp"
+        if "WHATSAPP_UNAVAILABLE" in emitted:
+            return "other_whatsapp"
+
+    if state == State.VERIFY_PINCODE:
+        if "UNCLEAR" in emitted:
+            return "pincode_unknown"
+        if "AFFIRM" in emitted:
+            return "confirm_existing_pincode"
+
+    if state in {State.VERIFY_BUSINESS_DETAILS, State.CONFIRM_BUSINESS_DETAILS}:
+        if "AFFIRM" in emitted:
+            return "business_details_confirmed"
+        if "INFORM" in emitted:
+            return "business_details_corrected"
+
+    if state == State.VERIFY_EMAIL:
+        if "AFFIRM" in emitted:
+            return "email_confirmed"
+        if "INFORM" in emitted:
+            return "email_correction_attempt"
+
+    if state == State.COLLECT_EMAIL_CORRECTION:
+        if "DENY" in emitted:
+            return "email_refused"
+
+    if state == State.CONFIRM_EMAIL_CORRECTION:
+        if "AFFIRM" in emitted:
+            return "email_confirmed"
+        if "INFORM" in emitted:
+            return "email_corrected"
+
+    if state == State.ASK_PURCHASE_AMOUNT:
+        if "DENY" in emitted:
+            return "purchase_amount_refused"
+        if "INFORM" in emitted:
+            return "purchase_amount_provided"
+
+    if state in {State.SUPPORT_AND_REFERRAL, State.REFERRAL_DECLINE_NUDGE}:
+        if "AFFIRM" in emitted:
+            return "referral_accepted"
+        if "DENY" in emitted:
+            return "referral_declined"
+
+    if state == State.ASK_CALLBACK_TIME and "CALLBACK_REQUESTED" in emitted:
+        return "callback_time_provided"
+
+    if state == State.CONFIRM_CALLBACK_TIME:
+        if "AFFIRM" in emitted:
+            return "callback_time_confirmed"
+        if "CALLBACK_REQUESTED" in emitted:
+            return "callback_time_updated"
+
+    return None
 
 
 _FRUSTRATION_PATTERNS = [
@@ -153,9 +362,14 @@ _DEALER_SETUP_PATTERNS = [
     r"setup",
     r"install",
     r"training",
+    r"ट्रेनिंग",
     r"configure",
     r"onboard",
     r"demo nahi",
+    r"इंस्टॉल",
+    r"इंस्टॉलेशन",
+    r"डीलर",
+    r"पार्टनर",
 ]
 
 _CLARIFICATION_PATTERNS = [
@@ -373,6 +587,57 @@ _BUSINESS_CLOSED_PATTERNS = [
     r"use\s+नहीं\s+कर",
 ]
 
+_WILL_NOT_USE_PATTERNS = [
+    r"never\s+use",
+    r"use\s+नहीं\s+करेंगे",
+    r"use\s+नहीं\s+करना",
+    r"नहीं\s+चलाना",
+    r"नहीं\s+यूज़",
+    r"बिलकुल\s+use\s+नहीं",
+]
+
+_EMPLOYEE_ON_LEAVE_PATTERNS = [
+    r"employee\s+on\s+leave",
+    r"operator\s+on\s+leave",
+    r"staff\s+leave",
+    r"लड़का\s+छुट्टी",
+    r"operator\s+छुट्टी",
+    r"कर्मचारी\s+छुट्टी",
+    r"leave\s+पर",
+]
+
+_MOBILE_NUMBER_CHANGE_PATTERNS = [
+    r"registered\s+mobile\s+number\s+change",
+    r"registered\s+number\s+update",
+    r"number\s+change\s+करवाना",
+    r"number\s+बदलवाना",
+    r"mobile\s+number\s+change",
+    r"contact\s+number\s+update",
+    r"registered\s+number",
+    r"नंबर\s+change",
+    r"नंबर\s+update",
+]
+
+_TICKET_FOLLOW_UP_PATTERNS = [
+    r"ticket.*(?:raise|lagayi|pata nahi)",
+    r"ticket.*(?:update|call)",
+    r"(?:kuch|koi)\s+(?:pata nahi|update nahi|call nahi)",
+]
+
+_USER_REDIRECT_PATTERNS = [
+    r"use\s+karta\s+hai",
+    r"owner\s+se",
+    r"beta\s+hai",
+    r"ladke\s+se",
+    r"ladka",
+    r"wo\s+dekhta\s+hai",
+    r"unhe\s+call\s+karo",
+    r"दुकान\s+पर\s+है",
+    r"उससे\s+बात",
+    r"वो\s+देखता\s+है",
+    r"वो\s+handle\s+करता\s+है",
+]
+
 _MIGRATION_DELAY_PATTERNS = [
     r"migration",
     r"data\s+entry",
@@ -469,12 +734,12 @@ def detect_billing_blocker_reason(transcript: str) -> str:
         return "setup_in_progress"
     if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in _TECHNICAL_PATTERNS):
         return "technical_issue"
+    if re.search(r"समझ नहीं|training|ट्रेनिंग|सीखा नहीं", lowered, re.IGNORECASE):
+        return "training_gap"
     if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in _DEALER_SETUP_PATTERNS):
         return "dealer_setup"
     if re.search(r"time नहीं|time nahi|समय नहीं|busy", lowered, re.IGNORECASE):
         return "no_time"
-    if re.search(r"समझ नहीं|training|सीखा नहीं", lowered, re.IGNORECASE):
-        return "training_gap"
     return "unknown"
 
 
@@ -485,6 +750,10 @@ def _looks_like_collection_status_request(state: State, transcript: str) -> bool
         State.COLLECT_ALTERNATE_NUMBER,
         State.COLLECT_PINCODE,
         State.COLLECT_REFERRAL_NUMBER,
+        State.COLLECT_WRONG_CONTACT_NUMBER,
+        State.COLLECT_MOBILE_UPDATE_NUMBER,
+        State.COLLECT_REFERRAL_PINCODE,
+        State.COLLECT_TRAINING_PINCODE,
     }:
         return False
     return any(re.search(pattern, transcript, re.IGNORECASE) for pattern in _COLLECTION_STATUS_PATTERNS)
@@ -526,8 +795,52 @@ def _is_audio_check(transcript: str) -> bool:
     return any(re.search(pattern, transcript, re.IGNORECASE) for pattern in _AUDIO_CHECK_PATTERNS)
 
 
+def _is_mobile_number_change_request(transcript: str) -> bool:
+    return any(re.search(pattern, transcript, re.IGNORECASE) for pattern in _MOBILE_NUMBER_CHANGE_PATTERNS)
+
+
+def _is_ticket_followup_request(transcript: str) -> bool:
+    return any(re.search(pattern, transcript, re.IGNORECASE) for pattern in _TICKET_FOLLOW_UP_PATTERNS)
+
+
+def _is_user_redirect_request(transcript: str) -> bool:
+    return any(re.search(pattern, transcript, re.IGNORECASE) for pattern in _USER_REDIRECT_PATTERNS)
+
+
+def _is_pincode_already_provided_reference(transcript: str) -> bool:
+    has_pincode = re.search(
+        r"pin\s*code|pincode|पिन\s*कोड|पिन",
+        transcript,
+        re.IGNORECASE,
+    )
+    has_reference = re.search(
+        r"अभी|पहले|पहले\s+ही|ऊपर|तो",
+        transcript,
+        re.IGNORECASE,
+    )
+    has_already_given = re.search(
+        r"बताया|दिया",
+        transcript,
+        re.IGNORECASE,
+    )
+    return bool(has_pincode and has_reference and has_already_given)
+
+
 def detect_prompt_exception_reason(transcript: str) -> str:
     lowered = transcript.lower()
+    # Fast substring guards for high-impact production detours. These avoid
+    # missing obvious cases because of regex/tokenization edge cases in mixed
+    # Hindi-English transcripts.
+    if "दूसरा software" in transcript or "दूसरे software" in transcript:
+        return "switched_software"
+    if "दुकान बंद" in transcript or "business बंद" in transcript:
+        return "business_closed"
+    if (
+        "use नहीं करना" in transcript
+        or "use नहीं करेंगे" in transcript
+        or "बिल्कुल use नहीं" in transcript
+    ):
+        return "will_not_use"
     if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in _ABUSIVE_PATTERNS):
         return "abusive_language"
     if re.search(r"\b(crash|bug|hang)\b", lowered, re.IGNORECASE):
@@ -540,6 +853,8 @@ def detect_prompt_exception_reason(transcript: str) -> str:
         return "business_closed"
     if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in _MIGRATION_DELAY_PATTERNS):
         return "migration_delay"
+    if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in _WILL_NOT_USE_PATTERNS):
+        return "will_not_use"
 
     reason = detect_billing_blocker_reason(transcript)
     if reason == "training_gap":
@@ -560,6 +875,10 @@ def map_workflow_answer(
     if _is_audio_check(transcript):
         return "audio_check"
 
+    grammar_workflow_answer = _workflow_answer_from_state_grammar(state, transcript)
+    if grammar_workflow_answer is not None:
+        return grammar_workflow_answer
+
     if state in {State.OPENING_GREETING, State.CONFIRM_IDENTITY}:
         if _is_opening_wrong_registration(transcript):
             return "opening_wrong_registration"
@@ -572,6 +891,15 @@ def map_workflow_answer(
 
     if state == State.CHECK_AVAILABILITY and _is_contact_unavailable(transcript):
         return "contact_unavailable"
+
+    if _is_mobile_number_change_request(transcript):
+        return "mobile_number_change_request"
+
+    if _is_ticket_followup_request(transcript):
+        return "ticket_followup_request"
+
+    if _is_user_redirect_request(transcript):
+        return "user_redirect_request"
 
     if (
         state
@@ -610,7 +938,12 @@ def map_workflow_answer(
     if state == State.ASK_WRONG_CONTACT_NAME and transcript.strip():
         return "wrong_contact_name_provided"
 
+    if state == State.ASK_TRAINING_PENDING_DURATION and transcript.strip():
+        return "training_duration_provided"
+
     if state == State.ASK_BILLING_STATUS:
+        if billing_started(transcript) and detect_prompt_exception_reason(transcript) == "training_pending":
+            return "billing_started_training_pending"
         if billing_started(transcript) or speech_act == Intent.AFFIRM:
             return "billing_started"
         if _is_not_started(transcript) or speech_act in {
@@ -626,6 +959,8 @@ def map_workflow_answer(
         return "complaint_detail_provided"
 
     if state == State.EXPLORE_BILLING_BLOCKER:
+        if billing_started(transcript):
+            return "billing_started"
         if _is_detail_refusal(transcript):
             return "billing_blocker_refused"
         if transcript.strip():
@@ -655,6 +990,12 @@ def map_workflow_answer(
         if transcript.strip():
             return "training_pincode_missing"
 
+    if state == State.TRAINING_HELP_CHECK:
+        if speech_act in {Intent.DENY, Intent.OBJECT, Intent.THANK} or re.search(r"नहीं|नही|no", lowered, re.IGNORECASE):
+            return "training_no_help"
+        if transcript.strip():
+            return "training_help_requested"
+
     if state == State.ASK_BILLING_START_TIMELINE:
         if query_type != QUERY_NONE:
             return "user_query"
@@ -683,6 +1024,11 @@ def map_workflow_answer(
             return "provide_alternate"
 
     if state == State.VERIFY_PINCODE:
+        if (
+            (session.pincode or session.crm_pincode or session.training_area_pincode)
+            and _is_pincode_already_provided_reference(transcript)
+        ):
+            return "confirm_existing_pincode"
         if re.search(
             "\u092e\u0941\u091d\u0947 \u0928\u0939\u0940\u0902 \u092a\u0924\u093e|\u092a\u0924\u093e \u0928\u0939\u0940\u0902|"
             "\u092f\u093e\u0926 \u0928\u0939\u0940\u0902|maloom nahi|pata nahi|yaad nahi",
@@ -746,6 +1092,8 @@ def map_workflow_answer(
             return "purchase_amount_refused"
         if re.search(r"याद नहीं|yaad nahi|नहीं पता|pata nahi", lowered, re.IGNORECASE):
             return "purchase_amount_unknown"
+        if speech_act in {Intent.DENY, Intent.OBJECT}:
+            return "purchase_amount_refused"
         if transcript.strip():
             return "purchase_amount_provided"
 
@@ -771,6 +1119,20 @@ def map_workflow_answer(
     if state == State.COLLECT_REFERRAL_NUMBER and _is_detail_refusal(transcript):
         return "referral_refused"
 
+    if state == State.COLLECT_REFERRAL_PINCODE:
+        if entities.pincode_digits or entities.digits:
+            return "referral_pincode_provided"
+        if _is_detail_refusal(transcript):
+            return "referral_refused"
+
+    if state == State.CONFIRM_REFERRAL_DETAILS:
+        if speech_act in {Intent.AFFIRM, Intent.THANK}:
+            return "referral_details_confirmed"
+        if entities.pincode_digits or entities.phone_digits or entities.digits:
+            return "referral_pincode_provided"
+        if speech_act in {Intent.DENY, Intent.INFORM, Intent.ELABORATE, Intent.REQUEST, Intent.OBJECT}:
+            return "referral_details_rejected"
+
     if state == State.REFERRAL_DECLINE_NUDGE:
         if speech_act in {Intent.DENY, Intent.OBJECT} or _is_detail_refusal(transcript):
             return "referral_declined"
@@ -783,6 +1145,12 @@ def map_workflow_answer(
             Intent.GREET,
         }:
             return "referral_accepted"
+
+    if state == State.COLLECT_WRONG_CONTACT_NUMBER and entities.phone_digits:
+        return "digits_provided"
+
+    if state == State.COLLECT_MOBILE_UPDATE_NUMBER and entities.phone_digits:
+        return "digits_provided"
 
     if state == State.ASK_CALLBACK_TIME:
         if has_callback_request(transcript) and not extract_callback_phrase(transcript):
@@ -813,6 +1181,9 @@ def map_workflow_answer(
         State.CONFIRM_PINCODE,
         State.COLLECT_REFERRAL_NUMBER,
         State.CONFIRM_REFERRAL_NUMBER,
+        State.CONFIRM_WRONG_CONTACT_NUMBER,
+        State.CONFIRM_MOBILE_UPDATE_NUMBER,
+        State.CONFIRM_TRAINING_PINCODE,
     } and entities.digits:
         return "digits_provided"
 
@@ -822,6 +1193,9 @@ def map_workflow_answer(
         State.CONFIRM_ALTERNATE_NUMBER,
         State.CONFIRM_PINCODE,
         State.CONFIRM_REFERRAL_NUMBER,
+        State.CONFIRM_WRONG_CONTACT_NUMBER,
+        State.CONFIRM_MOBILE_UPDATE_NUMBER,
+        State.CONFIRM_TRAINING_PINCODE,
     }:
         if query_type != QUERY_NONE and not entities.digits:
             return "user_query"
@@ -829,6 +1203,12 @@ def map_workflow_answer(
             return "digits_confirmed"
         if speech_act in {Intent.DENY, Intent.INFORM, Intent.ELABORATE, Intent.REQUEST, Intent.OBJECT}:
             return "digits_rejected"
+
+    if state == State.WRONG_NUMBER_HELP_CHECK:
+        if speech_act in {Intent.DENY, Intent.OBJECT, Intent.THANK} or re.search(r"नहीं|नही|no", lowered, re.IGNORECASE):
+            return "wrong_number_no_help"
+        if transcript.strip():
+            return "wrong_number_help_requested"
 
     if query_type != QUERY_NONE:
         return "user_query"
@@ -845,6 +1225,11 @@ def parse_turn(
 ) -> TurnFrame:
     active_session = replace(session, current_state=state_override) if state_override else session
     normalized = _normalized_text(transcript)
+    speech_act = _override_speech_act_with_state_grammar(
+        active_session.current_state,
+        normalized,
+        speech_act,
+    )
     named_digit_slots = extract_named_digit_slots(normalized)
     raw_digits = extract_digits(normalized)
     parsed_digits = raw_digits

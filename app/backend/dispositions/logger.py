@@ -1,12 +1,10 @@
-﻿import json
-import logging
+﻿import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 from state_machine.session import CallSession
+from utils.logger import CALL_SUMMARY_PATH, TURN_METRICS_PATH, append_jsonl_record
 
 logger = logging.getLogger(__name__)
-LOG_FILE = Path(__file__).resolve().parents[3] / "call_logs.jsonl"
 
 
 async def log_call(session: CallSession):
@@ -40,6 +38,11 @@ async def log_call(session: CallSession):
             "referral_number": session.referral_number,
         },
         "transcript_turns": len(session.transcript),
+        "transcript": list(session.transcript),
+        "telemetry_summary": getattr(session, "telemetry_summary", None),
+        "artifacts": {
+            "turn_metrics_path": str(TURN_METRICS_PATH),
+        },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -51,8 +54,7 @@ async def log_call(session: CallSession):
     )
 
     try:
-        with LOG_FILE.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_jsonl_record(CALL_SUMMARY_PATH, record)
     except Exception as exc:
         logger.error("Failed to write call log: %s", exc)
 

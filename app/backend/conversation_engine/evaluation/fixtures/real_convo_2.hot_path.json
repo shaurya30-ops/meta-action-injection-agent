@@ -1,0 +1,186 @@
+[
+  {
+    "id": "opening-affirm-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "OPENING_GREETING",
+    "utterance": "हाँ जी बताइए मैम",
+    "expected_events": ["AFFIRM"],
+    "notes": "सीधा identity confirm + continue signal"
+  },
+  {
+    "id": "opening-ask-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "OPENING_GREETING",
+    "utterance": "हो रही है?",
+    "expected_events": ["ASK"],
+    "notes": "व्यक्ति opening को वापस दोहराता है"
+  },
+  {
+    "id": "confirm-affirm-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "CONFIRM_IDENTITY",
+    "utterance": "हां जी हो रही है.",
+    "expected_events": ["AFFIRM"],
+    "notes": "clarification के बाद identity confirm"
+  },
+  {
+    "id": "availability-affirm-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "CHECK_AVAILABILITY",
+    "utterance": "बताओ",
+    "expected_events": ["AFFIRM"],
+    "notes": "minimal continue signal"
+  },
+  {
+    "id": "availability-affirm-ask-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "CHECK_AVAILABILITY",
+    "utterance": "अरे मैडम बात कर सकते हैं बताओ ना आगे क्या काम है",
+    "expected_events": ["AFFIRM", "ASK"],
+    "notes": "continue + purpose query"
+  },
+  {
+    "id": "availability-system-noise-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "CHECK_AVAILABILITY",
+    "utterance": "This call is now being recorded.",
+    "expected_events": ["SYSTEM_NOISE"],
+    "notes": "carrier announcement"
+  },
+  {
+    "id": "busy-nudge-affirm-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "BUSY_NUDGE",
+    "utterance": "हां",
+    "expected_events": ["AFFIRM"],
+    "notes": "user accepts nudge"
+  },
+  {
+    "id": "billing-started-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "ASK_BILLING_STATUS",
+    "utterance": "billing start हो गई है मैम।",
+    "expected_events": ["BILLING_STARTED", "INFORM"],
+    "notes": "plain positive billing status"
+  },
+  {
+    "id": "billing-not-started-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "ASK_BILLING_STATUS",
+    "utterance": "बिलिंग मैम start नहीं हुई है अभी।",
+    "expected_events": ["BILLING_NOT_STARTED", "DENY"],
+    "notes": "plain negative billing status"
+  },
+  {
+    "id": "billing-install-pending-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "ASK_BILLING_STATUS",
+    "utterance": "अभी तक तो अपना software ही install नहीं हुआ है system में",
+    "expected_events": ["BILLING_NOT_STARTED", "INSTALLATION_PENDING"],
+    "notes": "deterministic install blocker"
+  },
+  {
+    "id": "billing-training-pending-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "ASK_BILLING_STATUS",
+    "utterance": "Billing तो start हो गई है पर training नहीं हुई है.",
+    "expected_events": ["BILLING_STARTED", "TRAINING_PENDING"],
+    "notes": "mixed state that must interrupt into training handler"
+  },
+  {
+    "id": "blocker-training-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "EXPLORE_BILLING_BLOCKER",
+    "utterance": "मेरे को software समझ नहीं आ रहा कि मैं कैसे उसको use कर पाऊँ",
+    "expected_events": ["TRAINING_PENDING", "INFORM"],
+    "notes": "training gap reason"
+  },
+  {
+    "id": "blocker-installation-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "EXPLORE_BILLING_BLOCKER",
+    "utterance": "dealer अभी तक मेरे पास visit नहीं किया है",
+    "expected_events": ["INSTALLATION_PENDING", "INFORM"],
+    "notes": "partner delay reason"
+  },
+  {
+    "id": "whatsapp-available-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "VERIFY_WHATSAPP",
+    "utterance": "हाँ जी मैम WhatsApp पे available है",
+    "expected_events": ["WHATSAPP_AVAILABLE", "AFFIRM"],
+    "notes": "same number on WhatsApp"
+  },
+  {
+    "id": "whatsapp-training-interrupt-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "VERIFY_WHATSAPP",
+    "utterance": "हाँ जी मैम WhatsApp पे available है but मैम मेरे को ना training की requirement है",
+    "expected_events": ["WHATSAPP_AVAILABLE", "TRAINING_PENDING"],
+    "notes": "availability confirm + training detour"
+  },
+  {
+    "id": "alternate-decline-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "ASK_ALTERNATE_NUMBER",
+    "utterance": "नहीं मैम but मुझे मेरा register mobile number change कराना है",
+    "expected_events": ["DENY"],
+    "notes": "declines alternate before separate number-change request"
+  },
+  {
+    "id": "pincode-confirm-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "VERIFY_PINCODE",
+    "utterance": "हाँ जी Ma'am सही है PIN code",
+    "expected_events": ["AFFIRM"],
+    "notes": "recorded pincode confirmed"
+  },
+  {
+    "id": "business-correct-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "VERIFY_BUSINESS_DETAILS",
+    "utterance": "नहीं, business type pharma है और trade wholesaler है.",
+    "expected_events": ["INFORM"],
+    "notes": "business profile correction"
+  },
+  {
+    "id": "email-confirm-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "VERIFY_EMAIL",
+    "utterance": "हाँ जी same ही है mail ID",
+    "expected_events": ["INFORM"],
+    "notes": "email confirmation spoken in natural mixed wording"
+  },
+  {
+    "id": "email-correction-fragment-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "COLLECT_EMAIL_CORRECTION",
+    "utterance": "utkarsh dot soni at the rate gmail dot com",
+    "expected_events": ["INFORM"],
+    "notes": "spoken email correction fragment"
+  },
+  {
+    "id": "amount-refusal-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "ASK_PURCHASE_AMOUNT",
+    "utterance": "याद नहीं है",
+    "expected_events": ["DENY"],
+    "notes": "amount refusal"
+  },
+  {
+    "id": "referral-accept-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "SUPPORT_AND_REFERRAL",
+    "utterance": "हाँ जी हाँ जी लिखिएगा 1 व्यक्ति है",
+    "expected_events": ["AFFIRM"],
+    "notes": "referral accepted"
+  },
+  {
+    "id": "callback-time-001",
+    "source_file": "REAL-CONVO-2.txt",
+    "state": "ASK_CALLBACK_TIME",
+    "utterance": "कल 2 बजे तक call करवा दो",
+    "expected_events": ["CALLBACK_REQUESTED", "INFORM"],
+    "notes": "specific callback slot"
+  }
+]

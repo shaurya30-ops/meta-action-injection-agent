@@ -1,4 +1,5 @@
-﻿import datetime
+import datetime
+import re
 from typing import List
 
 import config
@@ -23,7 +24,7 @@ from .actions import ACTION_MAP
 from .intents import Intent
 from .session import CallSession
 from .states import State
-from .turn_parser import TurnFrame, detect_prompt_exception_reason, parse_turn
+from .turn_parser import TurnFrame, _is_pincode_already_provided_reference, detect_prompt_exception_reason, parse_turn
 from .transitions import AUTO_TRANSITIONS, GLOBAL_OVERRIDES, TRANSITIONS
 
 TERMINAL_OR_AUTO_STATES = {
@@ -31,7 +32,9 @@ TERMINAL_OR_AUTO_STATES = {
     State.REFERRAL_DECLINE_NUDGE,
     State.CALLBACK_CLOSING,
     State.INVALID_REGISTRATION,
+    State.WRONG_NUMBER_CLOSING,
     State.WARM_CLOSING,
+    State.MOBILE_UPDATE_CONFIRMED,
     State.FIXED_CLOSING,
     State.LOG_DISPOSITION,
     State.END,
@@ -70,6 +73,22 @@ PHONE_COLLECTION_STATES: dict[State, tuple[str, str, str, State, str, int]] = {
         "referral number",
         10,
     ),
+    State.COLLECT_WRONG_CONTACT_NUMBER: (
+        "wrong_contact_digit_buffer",
+        "awaiting_wrong_contact_confirmation",
+        "wrong_contact_number",
+        State.CONFIRM_WRONG_CONTACT_NUMBER,
+        "correct contact number",
+        10,
+    ),
+    State.COLLECT_MOBILE_UPDATE_NUMBER: (
+        "mobile_update_digit_buffer",
+        "awaiting_mobile_update_confirmation",
+        "mobile_update_number",
+        State.CONFIRM_MOBILE_UPDATE_NUMBER,
+        "new mobile number",
+        10,
+    ),
 }
 
 PHONE_CONFIRMATION_STATES: dict[State, tuple[str, str, str, State, State, str, int]] = {
@@ -95,9 +114,27 @@ PHONE_CONFIRMATION_STATES: dict[State, tuple[str, str, str, State, State, str, i
         "referral_digit_buffer",
         "awaiting_referral_confirmation",
         "referral_number",
-        State.PRE_CLOSING,
+        State.COLLECT_REFERRAL_PINCODE,
         State.COLLECT_REFERRAL_NUMBER,
         "referral number",
+        10,
+    ),
+    State.CONFIRM_WRONG_CONTACT_NUMBER: (
+        "wrong_contact_digit_buffer",
+        "awaiting_wrong_contact_confirmation",
+        "wrong_contact_number",
+        State.WRONG_NUMBER_PITCH,
+        State.COLLECT_WRONG_CONTACT_NUMBER,
+        "correct contact number",
+        10,
+    ),
+    State.CONFIRM_MOBILE_UPDATE_NUMBER: (
+        "mobile_update_digit_buffer",
+        "awaiting_mobile_update_confirmation",
+        "mobile_update_number",
+        State.MOBILE_UPDATE_CONFIRMED,
+        State.COLLECT_MOBILE_UPDATE_NUMBER,
+        "new mobile number",
         10,
     ),
 }
@@ -239,23 +276,23 @@ def _route_billing_exception(session: CallSession, transcript: str, *, from_comp
     if reason == "switched_software":
         session.blocker_owner = "customer"
         return State.ESCALATE_SWITCHED_SOFTWARE
-    if reason == "business_closed":
+    if reason in {"business_closed", "will_not_use"}:
         session.blocker_owner = "customer"
         return State.ESCALATE_CLOSURE_REASON
     if reason in {"training_pending", "dealer_setup"}:
         session.blocker_owner = "partner"
-        return State.COLLECT_TRAINING_PINCODE
+        return State.TRAINING_PENDING_ACK
     if reason == "technical_issue":
         session.blocker_owner = "support"
         if from_complaint:
             session.technical_issue_detail = transcript.strip()
             return _close_with_acknowledgement(
                 session,
-                State.WARM_CLOSING,
-                "जी, issue note कर लिया है. Marg Help और Ticket option available हैं. हमारी team 24 घंटों के अंदर contact करेगी।",
+                State.REDIRECT_CLOSING,
+                "जी, issue note कर लिया है. हमारी team 24 घंटों के अंदर contact करेगी।",
             )
         return State.ESCALATE_TECHNICAL_ISSUE
-    if reason in {"migration_delay", "setup_in_progress", "no_time"}:
+    if reason in {"migration_delay", "setup_in_progress", "no_time", "employee_on_leave"}:
         session.blocker_owner = "customer"
         return State.ASK_BILLING_START_TIMELINE
     return State.EXPLORE_BILLING_BLOCKER
@@ -384,6 +421,8 @@ def _should_interrupt_for_query(session: CallSession, turn: TurnFrame) -> bool:
         return False
     if turn.workflow_answer == "audio_check":
         return False
+    if turn.workflow_answer == "training_pending_interrupt":
+        return False
     if session.current_state in {
         State.COLLECT_COMPLAINT_DETAIL,
         State.ESCALATE_PAYMENT_DATE,
@@ -392,14 +431,24 @@ def _should_interrupt_for_query(session: CallSession, turn: TurnFrame) -> bool:
         State.ESCALATE_SWITCH_REASON,
         State.ESCALATE_CLOSURE_REASON,
         State.ESCALATE_TECHNICAL_ISSUE,
+        State.ESCALATION_HELP_CHECK,
+        State.TRAINING_PENDING_ACK,
+        State.ASK_TRAINING_PENDING_DURATION,
         State.COLLECT_TRAINING_PINCODE,
+        State.CONFIRM_TRAINING_PINCODE,
+        State.TRAINING_REASSURANCE,
+        State.TRAINING_HELP_CHECK,
         State.ASK_BILLING_START_TIMELINE,
         State.DETOUR_ANYTHING_ELSE,
     } and turn.workflow_answer not in {"unknown", "user_query"}:
         return False
     if session.current_state == State.ANSWER_USER_QUERY:
         return False
-    if session.current_state == State.ASK_BILLING_STATUS and turn.workflow_answer in {"billing_started", "billing_not_started"}:
+    if session.current_state == State.ASK_BILLING_STATUS and turn.workflow_answer in {
+        "billing_started",
+        "billing_not_started",
+        "billing_started_training_pending",
+    }:
         return False
     if session.current_state == State.ASK_PURCHASE_AMOUNT and turn.workflow_answer in {
         "purchase_amount_provided",
@@ -464,6 +513,13 @@ def _build_response_prefix(
         State.ASK_WRONG_CONTACT_TRADE,
         State.ASK_WRONG_CONTACT_TYPE,
         State.ASK_WRONG_CONTACT_NAME,
+        State.COLLECT_WRONG_CONTACT_NUMBER,
+        State.CONFIRM_WRONG_CONTACT_NUMBER,
+        State.COLLECT_WRONG_CONTACT_NUMBER,
+        State.CONFIRM_WRONG_CONTACT_NUMBER,
+        State.WRONG_NUMBER_PITCH,
+        State.WRONG_NUMBER_HELP_CHECK,
+        State.WRONG_NUMBER_CLOSING,
         State.ASK_CONCERNED_PERSON_CONTACT,
         State.COLLECT_CONCERNED_PERSON_NUMBER,
         State.CONFIRM_CONCERNED_PERSON_NUMBER,
@@ -480,14 +536,16 @@ def _build_response_prefix(
         State.CONFIRM_CALLBACK_TIME,
         State.CALLBACK_CLOSING,
         State.INVALID_REGISTRATION,
+        State.WRONG_NUMBER_CLOSING,
         State.WARM_CLOSING,
+        State.MOBILE_UPDATE_CONFIRMED,
         State.FIXED_CLOSING,
         State.END,
     }:
         return ""
 
     if previous_state == State.ANSWER_USER_QUERY and next_state != State.ANSWER_USER_QUERY:
-        return "ठीक है जी — तो मैं वापस आती हूँ जहाँ हम थे."
+        return ""
 
     if previous_state in {State.OPENING_GREETING, State.CONFIRM_IDENTITY} and next_state == State.CHECK_AVAILABILITY:
         return ""
@@ -501,6 +559,8 @@ def _build_response_prefix(
         return build_billing_blocker_support_prefix(session)
 
     if previous_state == State.EXPLORE_BILLING_BLOCKER and next_state == State.VERIFY_WHATSAPP:
+        if turn.workflow_answer == "billing_started":
+            return "ये तो अच्छी बात है."
         return build_billing_blocker_support_prefix(session)
 
     if previous_state == State.EXPLORE_BILLING_BLOCKER and next_state == State.ASK_BILLING_START_TIMELINE:
@@ -513,11 +573,11 @@ def _build_response_prefix(
             return build_billing_blocker_support_prefix(session)
         return "जी, समझ गई."
 
-    if previous_state == State.COLLECT_TRAINING_PINCODE and next_state == State.DETOUR_ANYTHING_ELSE:
-        return build_billing_blocker_support_prefix(session)
+    if previous_state == State.CONFIRM_TRAINING_PINCODE and next_state == State.TRAINING_REASSURANCE:
+        return "ठीक है।"
 
     if previous_state == State.DETOUR_ANYTHING_ELSE and next_state == State.VERIFY_WHATSAPP:
-        return "ठीक है जी — तो मैं verification continue करती हूँ."
+        return ""
 
     if previous_state in {State.VERIFY_WHATSAPP, State.CONFIRM_WHATSAPP_NUMBER} and next_state == State.ASK_ALTERNATE_NUMBER:
         return "जी, noted."
@@ -573,6 +633,10 @@ def _expected_slot_for_state(state: State) -> str:
         return "wrong_contact_type"
     if state == State.ASK_WRONG_CONTACT_NAME:
         return "wrong_contact_name"
+    if state in {State.COLLECT_WRONG_CONTACT_NUMBER, State.CONFIRM_WRONG_CONTACT_NUMBER}:
+        return "wrong_contact_number"
+    if state in {State.WRONG_NUMBER_PITCH, State.WRONG_NUMBER_HELP_CHECK}:
+        return "wrong_number_followup"
     if state in {State.ASK_CONCERNED_PERSON_CONTACT, State.COLLECT_CONCERNED_PERSON_NUMBER, State.CONFIRM_CONCERNED_PERSON_NUMBER}:
         return "concerned_person_contact"
     if state == State.ASK_BILLING_STATUS:
@@ -591,8 +655,12 @@ def _expected_slot_for_state(state: State) -> str:
         return "closure_reason"
     if state == State.ESCALATE_TECHNICAL_ISSUE:
         return "technical_issue"
-    if state == State.COLLECT_TRAINING_PINCODE:
+    if state == State.ASK_TRAINING_PENDING_DURATION:
+        return "training_duration"
+    if state in {State.COLLECT_TRAINING_PINCODE, State.CONFIRM_TRAINING_PINCODE}:
         return "training_pincode"
+    if state in {State.TRAINING_PENDING_ACK, State.TRAINING_REASSURANCE, State.TRAINING_HELP_CHECK}:
+        return "training_followup"
     if state in {State.EXPLORE_BILLING_BLOCKER, State.ASK_BILLING_START_TIMELINE}:
         return "billing_blocker"
     if state == State.DETOUR_ANYTHING_ELSE:
@@ -615,6 +683,16 @@ def _expected_slot_for_state(state: State) -> str:
         return "referral_name"
     if state in {State.COLLECT_REFERRAL_NUMBER, State.CONFIRM_REFERRAL_NUMBER}:
         return "referral_number"
+    if state in {State.COLLECT_REFERRAL_PINCODE, State.CONFIRM_REFERRAL_DETAILS}:
+        return "referral_pincode"
+    if state in {State.COLLECT_TICKET_NUMBER}:
+        return "ticket_number"
+    if state in {State.TICKET_ESCALATION_ACK, State.TICKET_HELP_CHECK}:
+        return "ticket_followup"
+    if state in {State.REDIRECT_COLLECT_NUMBER, State.REDIRECT_CONFIRM_NUMBER}:
+        return "redirect_number"
+    if state in {State.COLLECT_MOBILE_UPDATE_NUMBER, State.CONFIRM_MOBILE_UPDATE_NUMBER, State.MOBILE_UPDATE_CONFIRMED}:
+        return "mobile_update"
     if state == State.ANSWER_USER_QUERY:
         return "query_resolution"
     if state in {State.BUSY_NUDGE}:
@@ -667,7 +745,10 @@ def _apply_phone_digits(
 
     if status == "complete":
         setattr(session, awaiting_attr, True)
-        setattr(session, value_attr, "")
+        if confirm_state == State.COLLECT_REFERRAL_PINCODE:
+            setattr(session, value_attr, getattr(session, buffer_attr))
+        else:
+            setattr(session, value_attr, "")
         return confirm_state
 
     setattr(session, awaiting_attr, False)
@@ -851,7 +932,7 @@ def resolve_next_state(
             "जी, शायद अभी call properly complete नहीं हो पा रही, इसलिए मैं call यहीं close करती हूँ।",
         )
 
-    if turn.workflow_answer == "audio_check":
+    if turn.workflow_answer in {"audio_check", "system_noise"}:
         return session.current_state
 
     if _resolve_prompt_exception_reason(transcript) == "abusive_language" and session.current_state not in TERMINAL_OR_AUTO_STATES:
@@ -870,7 +951,7 @@ def resolve_next_state(
 
     if session.current_state in {State.OPENING_GREETING, State.CONFIRM_IDENTITY, State.CHECK_AVAILABILITY}:
         if turn.workflow_answer == "opening_wrong_registration":
-            return State.ASK_WRONG_CONTACT_COMPANY
+            return State.ASK_WRONG_CONTACT_NAME
         if turn.workflow_answer == "contact_unavailable":
             return _start_callback_scheduling(
                 session,
@@ -894,19 +975,27 @@ def resolve_next_state(
         if turn.workflow_answer == "wrong_contact_type_provided":
             return _close_with_acknowledgement(
                 session,
-                State.WARM_CLOSING,
+                State.REDIRECT_CLOSING,
                 "जी, जानकारी देने के लिए धन्यवाद. हम अपने records update कर देंगे।",
             )
         return State.ASK_WRONG_CONTACT_TYPE
 
     if session.current_state == State.ASK_WRONG_CONTACT_NAME:
         if turn.workflow_answer == "wrong_contact_name_provided":
-            name = extract_name_fragment(transcript)
-            acknowledgement = "जी, आपका बहुत धन्यवाद। हम अपने records में update कर देंगे।"
-            if name:
-                acknowledgement = f"जी {name}, आपका बहुत धन्यवाद। हम अपने records में update कर देंगे।"
-            return _close_with_acknowledgement(session, State.WARM_CLOSING, acknowledgement)
+            return State.COLLECT_WRONG_CONTACT_NUMBER
         return State.ASK_WRONG_CONTACT_NAME
+
+    if session.current_state == State.WRONG_NUMBER_HELP_CHECK:
+        if turn.workflow_answer == "wrong_number_no_help":
+            return State.WRONG_NUMBER_CLOSING
+        if turn.workflow_answer == "wrong_number_help_requested":
+            session.resume_state = State.WRONG_NUMBER_HELP_CHECK
+            session.resume_reason = State.WRONG_NUMBER_HELP_CHECK.value
+            session.last_user_query_type = turn.query_type or "general"
+            session.last_user_query_text = transcript
+            session.query_resolution_pending = True
+            return State.ANSWER_USER_QUERY
+        return State.WRONG_NUMBER_HELP_CHECK
 
     if (
         turn.workflow_answer == "concerned_person_redirect"
@@ -980,52 +1069,89 @@ def resolve_next_state(
             "जी, ठीक है — अगर अभी आप आगे continue नहीं करना चाहते, तो मैं call यहीं close करती हूँ।",
         )
 
-    if _should_interrupt_for_query(session, turn):
-        session.resume_state = session.current_state
-        session.resume_reason = session.current_state.value
-        session.last_user_query_type = turn.query_type
-        session.last_user_query_text = transcript
-        session.query_resolution_pending = True
-        return State.ANSWER_USER_QUERY
+    if turn.workflow_answer == "ticket_followup_request" and session.current_state not in TERMINAL_OR_AUTO_STATES:
+        _TICKET_HANDLER_STATES = {State.COLLECT_TICKET_NUMBER, State.TICKET_ESCALATION_ACK, State.TICKET_HELP_CHECK}
+        if session.current_state not in _TICKET_HANDLER_STATES:
+            session.ticket_resume_state = session.current_state
+            return State.COLLECT_TICKET_NUMBER
 
-    for override_intent, target_state, suppressed_states in GLOBAL_OVERRIDES:
-        if intent == override_intent and session.current_state not in suppressed_states:
-            if target_state == State.CALLBACK_CLOSING:
-                return _set_callback_closing(session, transcript)
-            if target_state == State.WARM_CLOSING:
-                return _close_with_acknowledgement(
-                    session,
-                    target_state,
-                    "जी, ठीक है — मैं call यहीं close करती हूँ।",
-                )
-            if target_state == State.BUSY_NUDGE:
-                session.callback_resume_state = session.current_state
-            return target_state
+    if turn.workflow_answer == "user_redirect_request" and session.current_state not in TERMINAL_OR_AUTO_STATES:
+        _REDIRECT_HANDLER_STATES = {State.REDIRECT_COLLECT_NUMBER, State.REDIRECT_CONFIRM_NUMBER}
+        if session.current_state not in _REDIRECT_HANDLER_STATES:
+            return State.REDIRECT_COLLECT_NUMBER
 
-    if session.current_state == State.ASK_BILLING_STATUS:
+    if turn.workflow_answer == "mobile_number_change_request" and session.current_state not in TERMINAL_OR_AUTO_STATES:
+        session.number_change_resume_state = session.current_state
+        return State.COLLECT_MOBILE_UPDATE_NUMBER
+
+    if session.current_state == State.COLLECT_TICKET_NUMBER:
+        ticket_number = transcript.strip()
+        if not ticket_number:
+            return State.COLLECT_TICKET_NUMBER
+        session.ticket_number = ticket_number
+        return State.TICKET_ESCALATION_ACK
+
+    if session.current_state == State.TICKET_ESCALATION_ACK:
+        return State.TICKET_HELP_CHECK
+
+    if session.current_state == State.TICKET_HELP_CHECK:
+        resume_state = session.ticket_resume_state or State.ASK_BILLING_STATUS
+        normalized = transcript.lower()
+        if (
+            intent in {Intent.DENY, Intent.GOODBYE, Intent.THANK}
+            or re.search(r"\b(?:no|nahi|nahin|nhi)\b", normalized, re.IGNORECASE)
+        ):
+            return resume_state
+        if turn.query_type != "none" or intent in {
+            Intent.AFFIRM,
+            Intent.REQUEST,
+            Intent.ASK,
+            Intent.UNCLEAR,
+            Intent.INFORM,
+            Intent.ELABORATE,
+        }:
+            session.resume_state = resume_state
+            session.resume_reason = resume_state.value
+            session.last_user_query_type = turn.query_type if turn.query_type != "none" else "general"
+            session.last_user_query_text = transcript
+            session.query_resolution_pending = True
+            return State.ANSWER_USER_QUERY
+        return resume_state
+
+    if session.current_state == State.REDIRECT_COLLECT_NUMBER:
+        phone_digits = _turn_phone_digits(turn)
+        if intent == Intent.DENY and not phone_digits:
+            return _close_with_acknowledgement(
+                session,
+                State.REDIRECT_CLOSING,
+                "जी, ठीक है — कोई बात नहीं। हम बाद में call कर लेंगे।",
+            )
+        if phone_digits:
+            return _apply_phone_digits(
+                session,
+                transcript,
+                buffer_attr="redirect_digit_buffer",
+                awaiting_attr="awaiting_redirect_confirmation",
+                value_attr="redirect_number",
+                confirm_state=State.REDIRECT_CONFIRM_NUMBER,
+                total_digits=10,
+                digits_override=phone_digits,
+            )
+        return State.REDIRECT_COLLECT_NUMBER
+
+    if session.current_state == State.REDIRECT_CONFIRM_NUMBER:
+        if intent == Intent.AFFIRM:
+            session.redirect_number = session.redirect_digit_buffer
+            session.redirect_digit_buffer = ""
+            session.awaiting_redirect_confirmation = False
+            return State.REDIRECT_CLOSING
         if turn.workflow_answer == "billing_started":
             session.billing_started = "STARTED"
             session.billing_blocker_reason = ""
+            session.last_blocker_reason = ""
             session.billing_blocker_refusal_count = 0
             session.billing_resume_state = None
             return State.VERIFY_WHATSAPP
-        if turn.workflow_answer == "billing_not_started":
-            session.billing_started = "NOT_STARTED"
-            session.billing_blocker_refusal_count = 0
-            return _route_billing_exception(
-                session,
-                transcript,
-                from_complaint=intent == Intent.COMPLAIN,
-            )
-
-    if session.current_state == State.COLLECT_COMPLAINT_DETAIL:
-        if turn.workflow_answer == "complaint_detail_provided":
-            return _route_billing_exception(session, transcript, from_complaint=True)
-        return State.COLLECT_COMPLAINT_DETAIL
-
-    if session.current_state == State.EXPLORE_BILLING_BLOCKER:
-        if intent == Intent.GOODBYE:
-            return _close_with_acknowledgement(session, State.WARM_CLOSING, "जी, ठीक है — मैं call यहीं close करती हूँ।")
         if turn.workflow_answer == "billing_blocker_refused":
             session.billing_blocker_refusal_count += 1
             if session.billing_blocker_refusal_count <= 2:
@@ -1041,11 +1167,7 @@ def resolve_next_state(
 
     if session.current_state == State.ESCALATE_PARTNER_NAME:
         if turn.workflow_answer == "partner_name_provided":
-            return _close_with_acknowledgement(
-                session,
-                State.WARM_CLOSING,
-                "जी, payment detail और partner detail note कर ली है. हम partner से contact करेंगे. 20 से 48 घंटों के अंदर update मिल जाना चाहिए।",
-            )
+            return State.ESCALATION_HELP_CHECK
         return State.ESCALATE_PARTNER_NAME
 
     if session.current_state == State.ESCALATE_SWITCHED_SOFTWARE:
@@ -1055,35 +1177,79 @@ def resolve_next_state(
 
     if session.current_state == State.ESCALATE_SWITCH_REASON:
         if turn.workflow_answer == "switch_reason_provided":
-            return _close_with_acknowledgement(
-                session,
-                State.WARM_CLOSING,
-                "जी, आपने जो feedback दिया वह मैंने note कर लिया है।",
-            )
+            return State.ESCALATION_HELP_CHECK
         return State.ESCALATE_SWITCH_REASON
 
     if session.current_state == State.ESCALATE_CLOSURE_REASON:
         if turn.workflow_answer == "closure_reason_provided":
-            return _close_with_acknowledgement(
-                session,
-                State.WARM_CLOSING,
-                "जी, आपने जो feedback दिया वह मैंने note कर लिया है।",
-            )
+            return State.ESCALATION_HELP_CHECK
         return State.ESCALATE_CLOSURE_REASON
 
     if session.current_state == State.ESCALATE_TECHNICAL_ISSUE:
         if turn.workflow_answer == "technical_issue_detail_provided":
-            return _close_with_acknowledgement(
-                session,
-                State.WARM_CLOSING,
-                "जी, issue note कर लिया है. Marg Help और Ticket option available हैं. हमारी team 24 घंटों के अंदर contact करेगी।",
-            )
+            return State.ESCALATION_HELP_CHECK
         return State.ESCALATE_TECHNICAL_ISSUE
 
+    if session.current_state == State.ASK_TRAINING_PENDING_DURATION:
+        if turn.workflow_answer == "training_duration_provided":
+            return State.COLLECT_TRAINING_PINCODE
+        return State.ASK_TRAINING_PENDING_DURATION
+
     if session.current_state == State.COLLECT_TRAINING_PINCODE:
-        if turn.workflow_answer == "training_pincode_provided":
-            return State.DETOUR_ANYTHING_ELSE
-        return State.COLLECT_TRAINING_PINCODE
+        if turn.workflow_answer == "collection_status_request":
+            session.collection_followup_prompt = _build_collection_status_prompt(
+                label="training pin code",
+                digits=session.training_area_pincode,
+                total_digits=6,
+                awaiting_confirmation=session.awaiting_training_pincode_confirmation,
+            )
+            return State.COLLECT_TRAINING_PINCODE
+        # If training pincode is already fully collected and the user is
+        # referencing a previously-provided answer, skip re-collection.
+        if (
+            len(session.training_area_pincode) == 6
+            and _is_pincode_already_provided_reference(transcript)
+        ):
+            session.awaiting_training_pincode_confirmation = False
+            return State.TRAINING_REASSURANCE
+        combined, status = apply_digit_buffer(session.training_area_pincode, _turn_pincode_digits(turn) or transcript, 6, hard_limit=True)
+        if status == "overflow":
+            session.training_area_pincode = ""
+            session.awaiting_training_pincode_confirmation = False
+            return State.COLLECT_TRAINING_PINCODE
+        if status == "no_digits":
+            return State.COLLECT_TRAINING_PINCODE
+        session.training_area_pincode = combined
+        session.awaiting_training_pincode_confirmation = status == "complete"
+        if status != "complete":
+            return State.COLLECT_TRAINING_PINCODE
+        return State.CONFIRM_TRAINING_PINCODE
+
+    if session.current_state == State.CONFIRM_TRAINING_PINCODE:
+        if intent == Intent.AFFIRM:
+            session.awaiting_training_pincode_confirmation = False
+            return State.TRAINING_REASSURANCE
+        if intent == Intent.DENY and not _turn_pincode_digits(turn):
+            session.training_area_pincode = ""
+            session.awaiting_training_pincode_confirmation = False
+            return State.COLLECT_TRAINING_PINCODE
+        if _turn_pincode_digits(turn):
+            session.training_area_pincode = ""
+            session.awaiting_training_pincode_confirmation = False
+            return State.COLLECT_TRAINING_PINCODE
+        return State.CONFIRM_TRAINING_PINCODE
+
+    if session.current_state == State.TRAINING_HELP_CHECK:
+        if turn.workflow_answer == "training_no_help":
+            return _resume_after_detour(session)
+        if turn.workflow_answer == "training_help_requested":
+            session.resume_state = State.TRAINING_HELP_CHECK
+            session.resume_reason = State.TRAINING_HELP_CHECK.value
+            session.last_user_query_type = turn.query_type or "general"
+            session.last_user_query_text = transcript
+            session.query_resolution_pending = True
+            return State.ANSWER_USER_QUERY
+        return State.TRAINING_HELP_CHECK
 
     if session.current_state == State.ASK_BILLING_START_TIMELINE:
         if intent == Intent.GOODBYE:
@@ -1091,6 +1257,22 @@ def resolve_next_state(
         if turn.workflow_answer == "billing_timeline_provided":
             return State.DETOUR_ANYTHING_ELSE
         return State.ASK_BILLING_START_TIMELINE
+
+    if session.current_state == State.ESCALATION_HELP_CHECK:
+        if (
+            intent in {Intent.DENY, Intent.GOODBYE}
+            or turn.workflow_answer in {"training_no_help", "wrong_number_no_help"}
+            or "no" in transcript.lower()
+        ):
+            return _close_with_acknowledgement(session, State.WARM_CLOSING, "")
+        if turn.query_type != "none":
+            session.resume_state = State.ESCALATION_HELP_CHECK
+            session.resume_reason = State.ESCALATION_HELP_CHECK.value
+            session.last_user_query_type = turn.query_type
+            session.last_user_query_text = transcript
+            session.query_resolution_pending = True
+            return State.ANSWER_USER_QUERY
+        return State.ESCALATION_HELP_CHECK
 
     if session.current_state == State.DETOUR_ANYTHING_ELSE:
         if intent == Intent.GOODBYE:
@@ -1229,7 +1411,7 @@ def resolve_next_state(
             session.awaiting_concerned_person_confirmation = False
             return _close_with_acknowledgement(
                 session,
-                State.WARM_CLOSING,
+                State.REDIRECT_CLOSING,
                 "जी, ठीक है. मैं इसी detail पर software संभालने वाले person से बात करने की कोशिश करूँगी।",
             )
 
@@ -1333,6 +1515,9 @@ def resolve_next_state(
         if turn.workflow_answer == "email_confirmed":
             session.email_refusal_count = 0
             return State.ASK_PURCHASE_AMOUNT
+        if turn.entities.email and turn.workflow_answer in {"email_correction_attempt", "email_corrected"}:
+            session.email_refusal_count = 0
+            return State.CONFIRM_EMAIL_CORRECTION
         if turn.workflow_answer == "email_corrected":
             session.email_refusal_count = 0
             return State.CONFIRM_EMAIL_CORRECTION
@@ -1347,6 +1532,9 @@ def resolve_next_state(
             session.email_refusal_count = 0
             session.email_fragment_buffer = ""
             return State.ASK_PURCHASE_AMOUNT
+        if turn.entities.email and turn.workflow_answer in {"email_correction_attempt", "email_corrected"}:
+            session.email_refusal_count = 0
+            return State.CONFIRM_EMAIL_CORRECTION
         if turn.workflow_answer == "email_corrected":
             session.email_refusal_count = 0
             return State.CONFIRM_EMAIL_CORRECTION
@@ -1363,6 +1551,9 @@ def resolve_next_state(
         if turn.workflow_answer == "email_confirmed":
             session.email_refusal_count = 0
             return State.ASK_PURCHASE_AMOUNT
+        if turn.entities.email and turn.workflow_answer in {"email_correction_attempt", "email_corrected"}:
+            session.email_refusal_count = 0
+            return State.CONFIRM_EMAIL_CORRECTION
         if turn.workflow_answer == "email_corrected":
             session.email_refusal_count = 0
             return State.CONFIRM_EMAIL_CORRECTION
@@ -1395,7 +1586,7 @@ def resolve_next_state(
                     awaiting_attr="awaiting_referral_confirmation",
                     value_attr="referral_number",
                     target_state=State.COLLECT_REFERRAL_NUMBER,
-                    confirm_state=State.CONFIRM_REFERRAL_NUMBER,
+                    confirm_state=State.COLLECT_REFERRAL_PINCODE,
                     total_digits=10,
                     digits_override=_turn_phone_digits(turn),
                 )
@@ -1411,7 +1602,7 @@ def resolve_next_state(
                 return State.REFERRAL_DECLINE_NUDGE
             return _close_with_acknowledgement(
                 session,
-                State.WARM_CLOSING,
+                State.REDIRECT_CLOSING,
                 "कोई बात नहीं जी, शायद अभी suitable time नहीं है।",
             )
         if _turn_phone_digits(turn):
@@ -1422,7 +1613,7 @@ def resolve_next_state(
                 awaiting_attr="awaiting_referral_confirmation",
                 value_attr="referral_number",
                 target_state=State.COLLECT_REFERRAL_NUMBER,
-                confirm_state=State.CONFIRM_REFERRAL_NUMBER,
+                confirm_state=State.COLLECT_REFERRAL_PINCODE,
                 total_digits=10,
                 digits_override=_turn_phone_digits(turn),
             )
@@ -1443,6 +1634,41 @@ def resolve_next_state(
             "कोई बात नहीं जी, शायद अभी suitable time नहीं है।",
         )
 
+    if session.current_state == State.COLLECT_REFERRAL_PINCODE:
+        if turn.workflow_answer == "collection_status_request":
+            session.collection_followup_prompt = _build_collection_status_prompt(
+                label="referral pin code",
+                digits=session.referral_pincode_digit_buffer,
+                total_digits=6,
+                awaiting_confirmation=session.awaiting_referral_pincode_confirmation,
+            )
+            return State.COLLECT_REFERRAL_PINCODE
+        combined, status = apply_digit_buffer(session.referral_pincode_digit_buffer, _turn_pincode_digits(turn) or transcript, 6, hard_limit=True)
+        if status == "overflow":
+            session.referral_pincode_digit_buffer = ""
+            session.awaiting_referral_pincode_confirmation = False
+            return State.COLLECT_REFERRAL_PINCODE
+        if status == "no_digits":
+            return State.COLLECT_REFERRAL_PINCODE
+        session.referral_pincode_digit_buffer = combined
+        session.awaiting_referral_pincode_confirmation = status == "complete"
+        if status != "complete":
+            return State.COLLECT_REFERRAL_PINCODE
+        return State.CONFIRM_REFERRAL_DETAILS
+
+    if session.current_state == State.CONFIRM_REFERRAL_DETAILS:
+        if turn.workflow_answer == "referral_details_confirmed":
+            session.referral_pincode = session.referral_pincode_digit_buffer
+            session.referral_pincode_digit_buffer = ""
+            session.awaiting_referral_pincode_confirmation = False
+            return State.PRE_CLOSING
+        if turn.workflow_answer == "referral_details_rejected":
+            session.referral_pincode = ""
+            session.referral_pincode_digit_buffer = ""
+            session.awaiting_referral_pincode_confirmation = False
+            return State.COLLECT_REFERRAL_PINCODE
+        return State.CONFIRM_REFERRAL_DETAILS
+
     if session.current_state == State.REFERRAL_DECLINE_NUDGE:
         if turn.workflow_answer == "referral_accepted":
             resume_state = session.referral_resume_state or State.SUPPORT_AND_REFERRAL
@@ -1456,7 +1682,7 @@ def resolve_next_state(
                         awaiting_attr="awaiting_referral_confirmation",
                         value_attr="referral_number",
                         target_state=State.COLLECT_REFERRAL_NUMBER,
-                        confirm_state=State.CONFIRM_REFERRAL_NUMBER,
+                        confirm_state=State.COLLECT_REFERRAL_PINCODE,
                         total_digits=10,
                         digits_override=_turn_phone_digits(turn),
                     )
@@ -1472,7 +1698,7 @@ def resolve_next_state(
                         awaiting_attr="awaiting_referral_confirmation",
                         value_attr="referral_number",
                         target_state=State.COLLECT_REFERRAL_NUMBER,
-                        confirm_state=State.CONFIRM_REFERRAL_NUMBER,
+                        confirm_state=State.COLLECT_REFERRAL_PINCODE,
                         total_digits=10,
                         digits_override=_turn_phone_digits(turn),
                     )
@@ -1487,18 +1713,20 @@ def resolve_next_state(
                     awaiting_attr="awaiting_referral_confirmation",
                     value_attr="referral_number",
                     target_state=State.COLLECT_REFERRAL_NUMBER,
-                    confirm_state=State.CONFIRM_REFERRAL_NUMBER,
+                    confirm_state=State.COLLECT_REFERRAL_PINCODE,
                     total_digits=10,
                     digits_override=_turn_phone_digits(turn),
                 )
+            if resume_state == State.COLLECT_REFERRAL_PINCODE:
+                return State.COLLECT_REFERRAL_PINCODE
             return resume_state
         if turn.workflow_answer == "referral_declined":
-            if session.referral_resume_state in {State.COLLECT_REFERRAL_NAME, State.COLLECT_REFERRAL_NUMBER} and session.referral_refusal_count < 2:
+            if session.referral_resume_state in {State.COLLECT_REFERRAL_NAME, State.COLLECT_REFERRAL_NUMBER, State.COLLECT_REFERRAL_PINCODE} and session.referral_refusal_count < 2:
                 session.referral_refusal_count += 1
                 return State.REFERRAL_DECLINE_NUDGE
             return _close_with_acknowledgement(
                 session,
-                State.WARM_CLOSING,
+                State.REDIRECT_CLOSING,
                 "कोई बात नहीं जी, शायद अभी suitable time नहीं है।",
             )
 
@@ -1558,7 +1786,10 @@ def post_transition(
     if effective_turn.affect == "disengaged":
         session.user_disengagement_count += 1
 
-    if effective_previous_state == State.EXPLORE_BILLING_BLOCKER:
+    if (
+        effective_previous_state == State.EXPLORE_BILLING_BLOCKER
+        and effective_turn.workflow_answer != "billing_started"
+    ):
         session.billing_blocker_reason = _resolve_prompt_exception_reason(transcript)
         session.last_blocker_reason = session.billing_blocker_reason
 
@@ -1602,7 +1833,16 @@ def post_transition(
                 reset=reset_buffer,
             )
 
-    if effective_previous_state in {State.VERIFY_EMAIL, State.COLLECT_EMAIL_CORRECTION, State.CONFIRM_EMAIL_CORRECTION} and effective_turn.workflow_answer == "email_corrected":
+    if (
+        effective_previous_state in {State.VERIFY_EMAIL, State.COLLECT_EMAIL_CORRECTION, State.CONFIRM_EMAIL_CORRECTION}
+        and (
+            effective_turn.workflow_answer == "email_corrected"
+            or (
+                effective_turn.workflow_answer == "email_correction_attempt"
+                and bool(effective_turn.entities.email)
+            )
+        )
+    ):
         extract_and_store(session, effective_previous_state, transcript)
 
     if effective_previous_state == State.ASK_PURCHASE_AMOUNT and effective_turn.workflow_answer in {
@@ -1630,6 +1870,13 @@ def post_transition(
         State.COLLECT_REFERRAL_NAME,
         State.COLLECT_REFERRAL_NUMBER,
         State.CONFIRM_REFERRAL_NUMBER,
+        State.COLLECT_REFERRAL_PINCODE,
+        State.CONFIRM_REFERRAL_DETAILS,
+        State.COLLECT_REFERRAL_PINCODE,
+        State.CONFIRM_REFERRAL_DETAILS,
+        State.COLLECT_MOBILE_UPDATE_NUMBER,
+        State.CONFIRM_MOBILE_UPDATE_NUMBER,
+        State.MOBILE_UPDATE_CONFIRMED,
     } and intent in {
         Intent.AFFIRM,
         Intent.INFORM,
@@ -1692,7 +1939,13 @@ def post_transition(
         State.ESCALATE_SWITCH_REASON,
         State.ESCALATE_CLOSURE_REASON,
         State.ESCALATE_TECHNICAL_ISSUE,
+        State.ESCALATION_HELP_CHECK,
+        State.TRAINING_PENDING_ACK,
+        State.ASK_TRAINING_PENDING_DURATION,
         State.COLLECT_TRAINING_PINCODE,
+        State.CONFIRM_TRAINING_PINCODE,
+        State.TRAINING_REASSURANCE,
+        State.TRAINING_HELP_CHECK,
         State.DETOUR_ANYTHING_ELSE,
         State.BUSY_NUDGE,
         State.ASK_CALLBACK_TIME,
@@ -1780,7 +2033,13 @@ def post_transition(
         State.ESCALATE_SWITCH_REASON,
         State.ESCALATE_CLOSURE_REASON,
         State.ESCALATE_TECHNICAL_ISSUE,
+        State.ESCALATION_HELP_CHECK,
+        State.TRAINING_PENDING_ACK,
+        State.ASK_TRAINING_PENDING_DURATION,
         State.COLLECT_TRAINING_PINCODE,
+        State.CONFIRM_TRAINING_PINCODE,
+        State.TRAINING_REASSURANCE,
+        State.TRAINING_HELP_CHECK,
         State.ASK_BILLING_START_TIMELINE,
         State.DETOUR_ANYTHING_ELSE,
     }:
@@ -1790,6 +2049,8 @@ def post_transition(
         State.COLLECT_REFERRAL_NAME,
         State.COLLECT_REFERRAL_NUMBER,
         State.CONFIRM_REFERRAL_NUMBER,
+        State.COLLECT_REFERRAL_PINCODE,
+        State.CONFIRM_REFERRAL_DETAILS,
         State.SUPPORT_AND_REFERRAL,
     }:
         session.referral_resume_state = None
@@ -1809,6 +2070,13 @@ def execute_auto_chain(session: CallSession, start_state: State) -> List[State]:
     while True:
         if ACTION_MAP.get(current) is not None:
             chain.append(current)
+
+        if current == State.MOBILE_UPDATE_CONFIRMED:
+            resume_state = session.number_change_resume_state or State.ASK_BILLING_STATUS
+            session.previous_state = current
+            session.current_state = resume_state
+            session.states_visited.append(resume_state)
+            break
 
         next_state = AUTO_TRANSITIONS.get(current)
         if next_state is None:

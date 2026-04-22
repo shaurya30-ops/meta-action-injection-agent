@@ -1,4 +1,4 @@
-﻿from content_extraction.extractor_logic import build_render_context
+from content_extraction.extractor_logic import build_render_context
 from state_machine.actions import ACTION_MAP
 from state_machine.session import CallSession
 from state_machine.states import State
@@ -13,7 +13,9 @@ PREFIX_EXEMPT_STATES = {
     State.OPENING_GREETING,
     State.CALLBACK_CLOSING,
     State.INVALID_REGISTRATION,
+    State.WRONG_NUMBER_CLOSING,
     State.WARM_CLOSING,
+    State.MOBILE_UPDATE_CONFIRMED,
     State.FIXED_CLOSING,
     State.END,
 }

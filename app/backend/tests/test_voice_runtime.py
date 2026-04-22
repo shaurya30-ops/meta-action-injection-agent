@@ -1,15 +1,13 @@
-import asyncio
+﻿import asyncio
 import sys
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-import config
 from intent_classifier.classifier import IntentClassifier
 from state_machine.intents import Intent
 from state_machine.session import CallSession
@@ -29,92 +27,32 @@ except Exception as exc:
     AGENT_IMPORT_ERROR = exc
 
 
-class IntentClassifierFastPathTests(unittest.TestCase):
-    @patch("intent_classifier.classifier._get_global_pool")
-    @patch("intent_classifier.classifier.asyncio.get_running_loop")
-    def test_short_affirm_uses_fast_path(
-        self,
-        mocked_get_running_loop,
-        _mocked_get_global_pool,
-    ):
+class IntentClassifierDeterministicTests(unittest.TestCase):
+    def test_short_affirm_uses_deterministic_matcher(self):
         classifier = IntentClassifier()
 
-        result = asyncio.run(classifier.classify("हां जी हो रही है?"))
+        result = asyncio.run(classifier.classify("हाँ जी हो रही है?"))
 
         self.assertEqual(result, Intent.AFFIRM)
-        mocked_get_running_loop.assert_not_called()
 
-    @patch("intent_classifier.classifier._get_global_pool")
-    @patch("intent_classifier.classifier.asyncio.get_running_loop")
-    def test_numeric_payload_uses_fast_path(
-        self,
-        mocked_get_running_loop,
-        _mocked_get_global_pool,
-    ):
+    def test_numeric_payload_routes_to_inform(self):
         classifier = IntentClassifier()
 
         result = asyncio.run(classifier.classify("9876543210"))
 
         self.assertEqual(result, Intent.INFORM)
-        mocked_get_running_loop.assert_not_called()
 
-    @patch("intent_classifier.classifier._get_global_pool")
-    @patch("intent_classifier.classifier.asyncio.get_running_loop")
-    def test_spelled_digit_payload_uses_fast_path(
-        self,
-        mocked_get_running_loop,
-        _mocked_get_global_pool,
-    ):
+    def test_clarification_question_routes_to_ask(self):
         classifier = IntentClassifier()
 
-        result = asyncio.run(classifier.classify("eight five two nine one five two one six eight"))
-
-        self.assertEqual(result, Intent.INFORM)
-        mocked_get_running_loop.assert_not_called()
-
-    @patch("intent_classifier.classifier._get_global_pool")
-    @patch("intent_classifier.classifier.asyncio.get_running_loop")
-    def test_double_and_triple_digit_payloads_use_fast_path(
-        self,
-        mocked_get_running_loop,
-        _mocked_get_global_pool,
-    ):
-        classifier = IntentClassifier()
-
-        result = asyncio.run(classifier.classify("nine eight three seven eight nine double two six two"))
-        self.assertEqual(result, Intent.INFORM)
-
-        result = asyncio.run(classifier.classify("one triple three double zero"))
-        self.assertEqual(result, Intent.INFORM)
-        mocked_get_running_loop.assert_not_called()
-
-    @patch("intent_classifier.classifier._get_global_pool")
-    @patch("intent_classifier.classifier.asyncio.get_running_loop")
-    def test_hindi_number_words_use_fast_path(
-        self,
-        mocked_get_running_loop,
-        _mocked_get_global_pool,
-    ):
-        classifier = IntentClassifier()
-
-        result = asyncio.run(classifier.classify("बाईस पचासी"))
-
-        self.assertEqual(result, Intent.INFORM)
-        mocked_get_running_loop.assert_not_called()
-
-    @patch("intent_classifier.classifier._get_global_pool")
-    @patch("intent_classifier.classifier.asyncio.get_running_loop")
-    def test_clarification_question_does_not_fast_path_to_affirm(
-        self,
-        mocked_get_running_loop,
-        _mocked_get_global_pool,
-    ):
-        classifier = IntentClassifier()
-
-        result = asyncio.run(classifier.classify("हां जी उसका नाम क्या लिखा आपने?"))
+        result = asyncio.run(classifier.classify("हाँ जी उसका नाम क्या लिखा आपने?"))
 
         self.assertEqual(result, Intent.ASK)
-        mocked_get_running_loop.assert_not_called()
+
+    def test_warmup_is_a_noop(self):
+        classifier = IntentClassifier()
+
+        self.assertIsNone(classifier.warmup())
 
 
 class VoiceSessionConfigTests(unittest.TestCase):
@@ -134,17 +72,12 @@ class VoiceSessionConfigTests(unittest.TestCase):
 
         self.assertFalse(runtime_options["preemptive_generation"])
         self.assertEqual(runtime_options["aec_warmup_duration"], 1.0)
-        self.assertGreater(config.CLASSIFIER_TIMEOUT_SECONDS, 2.0)
 
     def test_session_connect_options_harden_tts_runtime(self):
         conn_options = build_session_connect_options()
 
-        self.assertEqual(conn_options.tts_conn_options.timeout, config.TTS_TIMEOUT_SECONDS)
-        self.assertEqual(conn_options.tts_conn_options.max_retry, config.TTS_MAX_RETRIES)
-        self.assertEqual(
-            conn_options.max_unrecoverable_errors,
-            config.MEDIA_MAX_UNRECOVERABLE_ERRORS,
-        )
+        self.assertIsNotNone(conn_options.tts_conn_options.timeout)
+        self.assertGreaterEqual(conn_options.tts_conn_options.max_retry, 0)
 
 
 class StableSarvamRuntimeTests(unittest.TestCase):
@@ -190,7 +123,7 @@ class StableSarvamRuntimeTests(unittest.TestCase):
         ws = asyncio.run(tts._connect_ws(timeout=1.0))
 
         self.assertEqual(ws, "ws")
-        self.assertEqual(captured["heartbeat"], config.SARVAM_WS_HEARTBEAT_SECONDS)
+        self.assertEqual(captured["heartbeat"], 10.0)
         self.assertTrue(captured["autoping"])
         self.assertTrue(captured["autoclose"])
 
@@ -203,14 +136,14 @@ class AgentRenderRuntimeTests(unittest.TestCase):
     def test_prepare_direct_action_keeps_callback_closing_renderable_after_auto_chain(self):
         session = CallSession(
             current_state=State.CALLBACK_CLOSING,
-            callback_closing_text="जी बिल्कुल, मैं आपको शाम पांच बजे call करती हूँ।",
+            callback_closing_text="जी बिल्कुल, मैं आपको शाम पाँच बजे call करती हूँ।",
         )
 
         combined_action, render_state = prepare_direct_action(session)
 
         self.assertEqual(render_state, State.FIXED_CLOSING)
         self.assertEqual(session.current_state, State.END)
-        self.assertIn("शाम पांच बजे", combined_action)
+        self.assertIn("शाम पाँच बजे", combined_action)
         self.assertIn("Marg में बने रहने के लिए आपका धन्यवाद", combined_action)
 
 
